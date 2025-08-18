@@ -212,6 +212,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                                 {
                                     type: "action",
                                     aid: currentAidRef.current,
+                                    label: lastActionLabelRef.current,
                                     tStart: Date.now(),
                                     tEnd: Date.now(),
                                     hasReq: true,
@@ -314,7 +315,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                                     {
                                         type: "action",
                                         aid: currentAidRef.current,
-                                        // label: lastActionLabelRef.current ?? undefined, // optional
+                                        label: lastActionLabelRef.current,
                                         tStart: now(),
                                         tEnd: now(),
                                         hasReq: true,
