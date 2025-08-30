@@ -268,6 +268,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
         });
         if (!r.ok) return;
         const sess = (await r.json()) as { sessionId: string; clockOffsetMs: number };
+        sessionIdRef.current = sess.sessionId;                 // <-- MISSING, add this
         offsetRef.current = Number(sess.clockOffsetMs || 0);
 
         // 2) hold original fetch & install interceptor
