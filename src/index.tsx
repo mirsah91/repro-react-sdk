@@ -440,30 +440,31 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
 
         // 1) upload rrweb chunks (internal; use original fetch)
         try {
-            const events = rrwebEventsRef.current;
-            const CHUNK = 500;
-            for (let i = 0; i < events.length; i += CHUNK) {
-                const slice = events.slice(i, i + CHUNK);
-                const seq = nextSeqRef.current++;
-                const tFirst = slice[0]?.timestamp ?? nowServer();
-                const tLast  = slice[slice.length - 1]?.timestamp ?? tFirst;
+            stopRecRef.current = record({
+                emit: (ev: any) => {
+                    rrwebEventsRef.current.push(ev);
 
-                await origFetch(`${base}/v1/sessions/${sid}/events`, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        Authorization: `Bearer ${token}`,
-                        [INTERNAL_HEADER]: "1",
-                    },
-                    body: JSON.stringify({
-                        type: "rrweb",
-                        seq,
-                        tFirst,
-                        tLast,
-                        events: slice, // send raw array
-                    }),
-                });
-            }
+                    if (rrwebEventsRef.current.length >= 200) {
+                        const slice = rrwebEventsRef.current.splice(0);
+                        const seq = nextSeqRef.current++;
+                        origFetchRef.current!(`${base}/v1/sessions/${sessionIdRef.current}/events`, {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json",
+                                Authorization: `Bearer ${sdkTokenRef.current}`,
+                                [INTERNAL_HEADER]: "1",
+                            },
+                            body: JSON.stringify({
+                                type: "rrweb",
+                                seq,
+                                tFirst: slice[0]?.timestamp,
+                                tLast: slice[slice.length - 1]?.timestamp,
+                                events: slice,
+                            }),
+                        }).catch(() => {});
+                    }
+                },
+            });
         } catch {
             /* ignore in MVP */
         } finally {
