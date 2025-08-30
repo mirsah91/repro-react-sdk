@@ -21,6 +21,11 @@ type Props = {
 const now = () => Date.now();
 const newAID = () => `A_${now()}_${Math.random().toString(36).slice(2, 6)}`;
 
+// server time normalization
+const offsetRef = { current: 0 };              // ms to add to client time
+const nowServer = () => now() + (offsetRef.current || 0);
+
+
 async function getJSON<T>(url: string) {
     const r = await fetch(url);
     if (!r.ok) throw new Error(`${r.status}`);
@@ -87,8 +92,8 @@ export function attachAxios(axiosInstance: any) {
                             [INTERNAL_HEADER]: "1",
                         },
                         body: JSON.stringify({
-                            seq: Date.now(),
-                            events: [{ type: "action", aid, tStart: Date.now(), tEnd: Date.now(), hasReq: true, ui: {} }],
+                            seq: nowServer(),
+                            events: [{ type: "action", aid, tStart: nowServer(), tEnd: nowServer(), hasReq: true, ui: {} }],
                         }),
                     } as RequestInit);
                 } catch {}
@@ -98,6 +103,8 @@ export function attachAxios(axiosInstance: any) {
         (err: any) => Promise.reject(err)
     );
 }
+
+type ActionMeta = { tStart: number; label?: string };
 
 export function ReproProvider({ appId, apiBase, children, button }: Props) {
     const base = apiBase || "http://localhost:4000";
@@ -112,6 +119,8 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
     const origFetchRef = useRef<typeof window.fetch>();
     const hasReqMarkedRef = useRef<Set<string>>(new Set());
     const lastActionLabelRef = useRef<string | null>(null);
+    const actionMeta = useRef<Map<string, ActionMeta>>(new Map());
+    const nextSeqRef = useRef<number>(1); // rrweb chunk counter
 
     // NEW: track installed click handler + dedupe recent clicks
     const clickHandlerRef = useRef<((e: MouseEvent) => void) | null>(null);
@@ -207,14 +216,14 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                             [INTERNAL_HEADER]: "1",
                         },
                         body: JSON.stringify({
-                            seq: Date.now(),
+                            seq: nowServer(),
                             events: [
                                 {
                                     type: "action",
                                     aid: currentAidRef.current,
                                     label: lastActionLabelRef.current,
-                                    tStart: Date.now(),
-                                    tEnd: Date.now(),
+                                    tStart: nowServer(),
+                                    tEnd: nowServer(),
                                     hasReq: true,
                                     ui: {},
                                 },
@@ -255,11 +264,11 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                 "Content-Type": "application/json",
                 Authorization: `Bearer ${sdkTokenRef.current}`,
             },
-            body: JSON.stringify({ clientTime: now() }),
+            body: JSON.stringify({ clientTime: nowServer() }),
         });
         if (!r.ok) return;
         const sess = (await r.json()) as { sessionId: string; clockOffsetMs: number };
-        sessionIdRef.current = sess.sessionId;
+        offsetRef.current = Number(sess.clockOffsetMs || 0);
 
         // 2) hold original fetch & install interceptor
         origFetchRef.current = window.fetch.bind(window);
@@ -310,14 +319,14 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                                 [INTERNAL_HEADER]: "1",
                             },
                             body: JSON.stringify({
-                                seq: now(),
+                                seq: nowServer(),
                                 events: [
                                     {
                                         type: "action",
                                         aid: currentAidRef.current,
                                         label: lastActionLabelRef.current,
-                                        tStart: now(),
-                                        tEnd: now(),
+                                        tStart: nowServer(),
+                                        tEnd: nowServer(),
                                         hasReq: true,
                                         ui: {},
                                     },
@@ -350,7 +359,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
 
             // Dedupe: ignore same-label clicks within 250ms (dev/StrictMode safety)
             const label = labelFromClickTarget(targetEl);
-            const t = now();
+            const t = nowServer();
             if (lastClickRef.current && t - lastClickRef.current.t < 250 && lastClickRef.current.label === label) {
                 return;
             }
@@ -434,6 +443,10 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
             const CHUNK = 500;
             for (let i = 0; i < events.length; i += CHUNK) {
                 const slice = events.slice(i, i + CHUNK);
+                const seq = nextSeqRef.current++;
+                const tFirst = slice[0]?.timestamp ?? nowServer();
+                const tLast  = slice[slice.length - 1]?.timestamp ?? tFirst;
+
                 await origFetch(`${base}/v1/sessions/${sid}/events`, {
                     method: "POST",
                     headers: {
@@ -442,12 +455,11 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                         [INTERNAL_HEADER]: "1",
                     },
                     body: JSON.stringify({
-                        seq: i,
-                        events: slice.map((e: any) => ({
-                            type: "rrweb",
-                            t: e.timestamp,
-                            chunk: JSON.stringify(e),
-                        })),
+                        type: "rrweb",
+                        seq,
+                        tFirst,
+                        tLast,
+                        events: slice, // send raw array
                     }),
                 });
             }
@@ -455,6 +467,8 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
             /* ignore in MVP */
         } finally {
             rrwebEventsRef.current = [];
+            nextSeqRef.current = 1;
+            actionMeta.current.clear();
         }
 
         // 2) finish (internal; use original fetch)
