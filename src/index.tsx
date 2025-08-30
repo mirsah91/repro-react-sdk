@@ -167,6 +167,49 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
         };
     }, [appId, base]);
 
+    const rrBufferRef = useRef<any[]>([]);
+    const rrFlushTimerRef = useRef<number | null>(null);
+    const CHUNK_SIZE = 200;         // send when buffer hits 200 events
+    const FLUSH_MS = 2000;          // or every 2s, whichever first
+
+    async function flushRrwebBuffer(reason: 'size'|'timer'|'stop') {
+        const sid = sessionIdRef.current;
+        const token = sdkTokenRef.current;
+        const base = (apiBase || "http://localhost:4000"); // or use your `base` const
+
+        if (!sid || !token) return;
+        if (!rrBufferRef.current.length) return;
+
+        // take all currently buffered events
+        const slice = rrBufferRef.current.splice(0);
+        const seq = nextSeqRef.current++;
+        const tFirst = slice[0]?.timestamp ?? nowServer();
+        const tLast  = slice[slice.length - 1]?.timestamp ?? tFirst;
+
+        try {
+            await (origFetchRef.current ?? window.fetch)(
+                `${base}/v1/sessions/${sid}/events`,
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        Authorization: `Bearer ${token}`,
+                        [INTERNAL_HEADER]: "1",
+                    },
+                    body: JSON.stringify({
+                        type: "rrweb",
+                        seq,
+                        tFirst,
+                        tLast,
+                        events: slice,
+                    }),
+                }
+            );
+        } catch {
+            // swallow in MVP
+        }
+    }
+
     /**
      * Auto-attach to window.axios if present.
      * If a team uses a custom Axios instance, they can call exported attachAxios(instance).
@@ -273,6 +316,14 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
 
         // 2) hold original fetch & install interceptor
         origFetchRef.current = window.fetch.bind(window);
+        nextSeqRef.current = 1;                                // reset for new session
+        rrBufferRef.current = [];
+
+        if (rrFlushTimerRef.current) window.clearInterval(rrFlushTimerRef.current);
+        rrFlushTimerRef.current = window.setInterval(() => {
+            flushRrwebBuffer('timer');
+        }, FLUSH_MS);
+
         window.fetch = async (input: RequestInfo | URL, init: RequestInit = {}) => {
             // figure request url
             const urlStr =
@@ -411,7 +462,11 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
         // 4) rrweb: keep events in memory; upload on stop()
         stopRecRef.current = record({
             emit: (ev: any) => {
-                rrwebEventsRef.current.push(ev);
+                rrBufferRef.current.push(ev);
+                // stream out if we reach CHUNK_SIZE
+                if (rrBufferRef.current.length >= CHUNK_SIZE) {
+                    flushRrwebBuffer('size');
+                }
             },
         });
 
@@ -434,37 +489,45 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
         stopRecRef.current?.();
         (stop as any)._cleanup?.();
 
+        // clear periodic timer
+        if (rrFlushTimerRef.current) {
+            window.clearInterval(rrFlushTimerRef.current);
+            rrFlushTimerRef.current = null;
+        }
+
+        // final flush of whatever is left
+        await flushRrwebBuffer('stop');
+
         const origFetch = origFetchRef.current ?? window.fetch.bind(window);
         const sid = sessionIdRef.current!;
         const token = sdkTokenRef.current!;
 
         // 1) upload rrweb chunks (internal; use original fetch)
         try {
-            stopRecRef.current = record({
-                emit: (ev: any) => {
-                    rrwebEventsRef.current.push(ev);
+            const events = rrwebEventsRef.current;
+            const CHUNK = 500;
+            for (let i = 0; i < events.length; i += CHUNK) {
+                const slice = events.slice(i, i + CHUNK);
+                const seq = nextSeqRef.current++;
+                const tFirst = slice[0]?.timestamp ?? nowServer();
+                const tLast  = slice[slice.length - 1]?.timestamp ?? tFirst;
 
-                    if (rrwebEventsRef.current.length >= 200) {
-                        const slice = rrwebEventsRef.current.splice(0);
-                        const seq = nextSeqRef.current++;
-                        origFetchRef.current!(`${base}/v1/sessions/${sessionIdRef.current}/events`, {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/json",
-                                Authorization: `Bearer ${sdkTokenRef.current}`,
-                                [INTERNAL_HEADER]: "1",
-                            },
-                            body: JSON.stringify({
-                                type: "rrweb",
-                                seq,
-                                tFirst: slice[0]?.timestamp,
-                                tLast: slice[slice.length - 1]?.timestamp,
-                                events: slice,
-                            }),
-                        }).catch(() => {});
-                    }
-                },
-            });
+                await origFetch(`${base}/v1/sessions/${sid}/events`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        Authorization: `Bearer ${token}`,
+                        [INTERNAL_HEADER]: "1",
+                    },
+                    body: JSON.stringify({
+                        type: "rrweb",
+                        seq,
+                        tFirst,
+                        tLast,
+                        events: slice, // send raw array
+                    }),
+                });
+            }
         } catch {
             /* ignore in MVP */
         } finally {
