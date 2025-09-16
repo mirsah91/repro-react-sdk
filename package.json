@@ -1,6 +1,6 @@
 {
   "name": "repro-react",
-  "version": "0.0.18",
+  "version": "0.0.20",
   "description": "Repro React SDK (MVP)",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -22,6 +22,7 @@
     "rrweb": ">=1 <2"
   },
   "devDependencies": {
+    "@types/pako": "^2.0.4",
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "react": "^18",
@@ -31,5 +32,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "pako": "^2.1.0"
   }
 }

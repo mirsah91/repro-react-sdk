@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { record } from "rrweb";
+import { gzip } from 'pako';
 
 /**
  * Repro React SDK (MVP)
@@ -16,6 +17,32 @@ type Props = {
     children: React.ReactNode;
     button?: { text?: string }; // optional override label
 };
+
+// config
+const MAX_BYTES = 900 * 1024; // 900 KB target per POST (tune)
+
+// estimate JSON bytes
+function jsonBytes(obj: any): number {
+    try { return new TextEncoder().encode(JSON.stringify(obj)).length; } catch { return Infinity; }
+}
+
+// split [events] into <= MAX_BYTES chunks by bisection
+function splitEventsBySize(events: any[], mkEnvelope: (slice:any[]) => any): any[][] {
+    const out: any[][] = [];
+    const stack: any[][] = [events.slice(0)]; // LIFO for fewer allocs
+    while (stack.length) {
+        const cur = stack.pop()!;
+        const env = mkEnvelope(cur);
+        if (jsonBytes(env) <= MAX_BYTES || cur.length <= 1) {
+            out.push(cur);
+            continue;
+        }
+        const mid = Math.floor(cur.length / 2);
+        stack.push(cur.slice(0, mid));
+        stack.push(cur.slice(mid));
+    }
+    return out;
+}
 
 // ---- small helpers ----
 const now = () => Date.now();
@@ -121,6 +148,8 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
     const lastActionLabelRef = useRef<string | null>(null);
     const actionMeta = useRef<Map<string, ActionMeta>>(new Map());
     const nextSeqRef = useRef<number>(1); // rrweb chunk counter
+    const isFlushingRef = useRef(false);
+    const backoffRef = useRef(0); // ms
 
     // NEW: track installed click handler + dedupe recent clicks
     const clickHandlerRef = useRef<((e: MouseEvent) => void) | null>(null);
@@ -169,46 +198,127 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
 
     const rrBufferRef = useRef<any[]>([]);
     const rrFlushTimerRef = useRef<number | null>(null);
-    const CHUNK_SIZE = 200;         // send when buffer hits 200 events
-    const FLUSH_MS = 2000;          // or every 2s, whichever first
+    const CHUNK_SIZE = 80;         // send when buffer hits 200 events
+    const FLUSH_MS = 1500;          // or every 2s, whichever first
+
+
+    async function sendChunkGzip({ baseUrl, sid, token, envelope, seq }:{
+        baseUrl:string; sid:string; token:string; envelope:any; seq:number;
+    }): Promise<'ok'|'too_large'|'fail'> {
+        try {
+            const json = JSON.stringify({ ...envelope, seq });
+            const gz = gzip(json); // Uint8Array
+            const r = await (origFetchRef.current ?? window.fetch)(`${baseUrl}/v1/sessions/${sid}/events`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Content-Encoding": "gzip",
+                    "Authorization": `Bearer ${token}`,
+                    [INTERNAL_HEADER]: "1",
+                },
+                body: gz,
+            });
+            if (r.status === 413) return 'too_large';
+            if (!r.ok) return 'fail';
+            return 'ok';
+        } catch {
+            return 'fail';
+        }
+    }
 
     async function flushRrwebBuffer(reason: 'size'|'timer'|'stop') {
+        if (isFlushingRef.current) return;
         const sid = sessionIdRef.current;
         const token = sdkTokenRef.current;
-        const base = (apiBase || "http://localhost:4000"); // or use your `base` const
-
+        const baseUrl = apiBase || "http://localhost:4000";
         if (!sid || !token) return;
         if (!rrBufferRef.current.length) return;
 
-        // take all currently buffered events
-        const slice = rrBufferRef.current.splice(0);
-        const seq = nextSeqRef.current++;
-        const tFirst = slice[0]?.timestamp ?? nowServer();
-        const tLast  = slice[slice.length - 1]?.timestamp ?? tFirst;
-
+        isFlushingRef.current = true;
         try {
-            await (origFetchRef.current ?? window.fetch)(
-                `${base}/v1/sessions/${sid}/events`,
-                {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        Authorization: `Bearer ${token}`,
-                        [INTERNAL_HEADER]: "1",
-                    },
-                    body: JSON.stringify({
-                        type: "rrweb",
-                        seq,
-                        tFirst,
-                        tLast,
-                        events: slice,
-                    }),
+            if (backoffRef.current > 0) {
+                await new Promise(r => setTimeout(r, backoffRef.current));
+            }
+
+            // COPY buffer; do not mutate until we know what succeeded
+            const fullSlice = rrBufferRef.current.slice(0);
+            const seq = nextSeqRef.current; // do NOT increment yet
+
+            const mkEnvelope = (slice:any[]) => {
+                const tFirst = slice[0]?.timestamp ?? nowServer();
+                const tLast  = slice[slice.length - 1]?.timestamp ?? tFirst;
+                return { type: 'rrweb', seq, tFirst, tLast, events: slice };
+            };
+
+            // Pre-split by size into <= MAX_BYTES pieces (same seq for first, then seq+1, …)
+            const pieces = splitEventsBySize(fullSlice, mkEnvelope);
+
+            // Send each piece in order, incrementing seq only on success per piece
+            let sentCount = 0;
+            for (let i = 0; i < pieces.length; i++) {
+                const piece = pieces[i];
+                const pieceSeq = seq + i; // stable seq per piece
+                const env = mkEnvelope(piece);
+
+                const jsonSize = jsonBytes(env);
+                let res: 'ok' | 'too_large' | 'fail';
+
+                if (jsonSize > 64 * 1024) {
+                    res = await sendChunkGzip({ baseUrl, sid, token, envelope: env, seq: pieceSeq });
+                } else {
+                    res = await sendChunk({ baseUrl, sid, token, envelope: env, seq: pieceSeq });
                 }
-            );
-        } catch {
-            // swallow in MVP
+                if (res === 'ok') {
+                    sentCount += piece.length;
+                    nextSeqRef.current = pieceSeq + 1; // advance to next expected seq
+                    backoffRef.current = 0;
+                    continue;
+                }
+
+                if (res === 'too_large' && piece.length > 1) {
+                    // If a piece is STILL too large after pre-split, split it again and retry
+                    const more = splitEventsBySize(piece, mkEnvelope);
+                    // splice into 'pieces' at current position
+                    pieces.splice(i, 1, ...more);
+                    i -= 1; // reprocess at same index
+                    continue;
+                }
+
+                // failure: stop; keep remaining events in buffer for retry
+                backoffRef.current = Math.min(4000, (backoffRef.current || 250) * 2);
+                break;
+            }
+
+            // success for `sentCount` events → drop them from buffer
+            if (sentCount > 0) {
+                rrBufferRef.current.splice(0, sentCount);
+            }
+        } finally {
+            isFlushingRef.current = false;
         }
     }
+
+    async function sendChunk({ baseUrl, sid, token, envelope, seq }:{
+        baseUrl:string; sid:string; token:string; envelope:any; seq:number;
+    }): Promise<'ok'|'too_large'|'fail'> {
+        try {
+            const r = await (origFetchRef.current ?? window.fetch)(`${baseUrl}/v1/sessions/${sid}/events`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${token}`,
+                    [INTERNAL_HEADER]: "1",
+                },
+                body: JSON.stringify({ ...envelope, seq }), // ensure seq matches piece
+            });
+            if (r.status === 413) return 'too_large';
+            if (!r.ok) return 'fail';
+            return 'ok';
+        } catch {
+            return 'fail';
+        }
+    }
+
 
     /**
      * Auto-attach to window.axios if present.
