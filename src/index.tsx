@@ -121,6 +121,8 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
     const lastActionLabelRef = useRef<string | null>(null);
     const actionMeta = useRef<Map<string, ActionMeta>>(new Map());
     const nextSeqRef = useRef<number>(1); // rrweb chunk counter
+    const isFlushingRef = useRef(false);
+    const backoffRef = useRef(0); // ms
 
     // NEW: track installed click handler + dedupe recent clicks
     const clickHandlerRef = useRef<((e: MouseEvent) => void) | null>(null);
@@ -169,44 +171,76 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
 
     const rrBufferRef = useRef<any[]>([]);
     const rrFlushTimerRef = useRef<number | null>(null);
-    const CHUNK_SIZE = 200;         // send when buffer hits 200 events
+    const CHUNK_SIZE = 100;         // send when buffer hits 200 events
     const FLUSH_MS = 2000;          // or every 2s, whichever first
 
     async function flushRrwebBuffer(reason: 'size'|'timer'|'stop') {
         const sid = sessionIdRef.current;
         const token = sdkTokenRef.current;
-        const base = (apiBase || "http://localhost:4000"); // or use your `base` const
-
+        const baseUrl = apiBase || "http://localhost:4000";
         if (!sid || !token) return;
         if (!rrBufferRef.current.length) return;
+        if (isFlushingRef.current) return;
 
-        // take all currently buffered events
-        const slice = rrBufferRef.current.splice(0);
-        const seq = nextSeqRef.current++;
-        const tFirst = slice[0]?.timestamp ?? nowServer();
-        const tLast  = slice[slice.length - 1]?.timestamp ?? tFirst;
-
+        isFlushingRef.current = true;
         try {
-            await (origFetchRef.current ?? window.fetch)(
-                `${base}/v1/sessions/${sid}/events`,
-                {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        Authorization: `Bearer ${token}`,
-                        [INTERNAL_HEADER]: "1",
-                    },
-                    body: JSON.stringify({
-                        type: "rrweb",
-                        seq,
-                        tFirst,
-                        tLast,
-                        events: slice,
-                    }),
-                }
-            );
+            // simple exponential backoff after failures
+            if (backoffRef.current > 0) {
+                await new Promise(r => setTimeout(r, backoffRef.current));
+            }
+
+            // COPY the buffer; don't mutate until success
+            const slice = rrBufferRef.current.slice(0);
+            const seq = nextSeqRef.current; // NOTE: do NOT increment yet
+            const tFirst = slice[0]?.timestamp ?? nowServer();
+            const tLast  = slice[slice.length - 1]?.timestamp ?? tFirst;
+
+            const res = await sendChunk({ baseUrl, sid, token, seq, tFirst, tLast, events: slice });
+
+            if (res === 'ok') {
+                // success: drop exactly that many events and bump seq
+                rrBufferRef.current.splice(0, slice.length);
+                nextSeqRef.current++;
+                backoffRef.current = 0;
+                return;
+            }
+
+            if (res === 'too_large' && slice.length > 1) {
+                // split into two halves, keep SAME seq for the first half
+                const mid = Math.floor(slice.length / 2);
+                // replace the buffer with two halves in order
+                rrBufferRef.current.splice(0, slice.length, ...slice.slice(0, mid), ...slice.slice(mid));
+                // tiny yield and try again
+                await new Promise(r => setTimeout(r, 0));
+                await flushRrwebBuffer(reason);
+                return;
+            }
+
+            // other failure: keep buffer, increase backoff
+            backoffRef.current = Math.min(4000, (backoffRef.current || 250) * 2);
+        } finally {
+            isFlushingRef.current = false;
+        }
+    }
+
+    async function sendChunk({ baseUrl, sid, token, seq, tFirst, tLast, events }:{
+        baseUrl:string; sid:string; token:string; seq:number; tFirst:number; tLast:number; events:any[];
+    }): Promise<'ok'|'too_large'|'fail'> {
+        try {
+            const r = await (origFetchRef.current ?? window.fetch)(`${baseUrl}/v1/sessions/${sid}/events`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    Authorization: `Bearer ${token}`,
+                    [INTERNAL_HEADER]: "1",
+                },
+                body: JSON.stringify({ type: "rrweb", seq, tFirst, tLast, events }),
+            });
+            if (r.status === 413) return 'too_large';
+            if (!r.ok) return 'fail';
+            return 'ok';
         } catch {
-            // swallow in MVP
+            return 'fail';
         }
     }
 
