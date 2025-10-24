@@ -67,6 +67,7 @@ type ReproCtx = {
     getSid: () => string | null;
     getAid: () => string | null;
     getToken: () => string | null;
+    getUserToken: () => string | null;
     getFetch: () => typeof window.fetch;
     hasReqMarked: Set<string>;
 };
@@ -107,6 +108,7 @@ export function attachAxios(axiosInstance: any) {
             const sid = ctx.getSid();
             const aid = ctx.getAid();
             const token = ctx.getToken();
+            const userToken = ctx.getUserToken();
 
             if (!isInternal && !isSdkInternal && sid && aid && token && !ctx.hasReqMarked.has(aid)) {
                 ctx.hasReqMarked.add(aid);
@@ -116,6 +118,7 @@ export function attachAxios(axiosInstance: any) {
                         headers: {
                             "Content-Type": "application/json",
                             Authorization: `Bearer ${token}`,
+                            ...(userToken ? { "x-app-user-token": userToken } : {}),
                             [INTERNAL_HEADER]: "1",
                         },
                         body: JSON.stringify({
@@ -135,6 +138,19 @@ type ActionMeta = { tStart: number; label?: string };
 
 export function ReproProvider({ appId, apiBase, children, button }: Props) {
     const base = apiBase || "http://localhost:4000";
+    type StoredAuth = { email: string; token: string; data: any } | null;
+    const storageKey = `repro-auth-${appId}`;
+
+    const initialAuth: StoredAuth = (() => {
+        if (typeof window === "undefined") return null;
+        try {
+            const raw = window.localStorage.getItem(storageKey);
+            if (!raw) return null;
+            return JSON.parse(raw) as StoredAuth;
+        } catch {
+            return null;
+        }
+    })();
 
     // ---- refs & state (hooks MUST be inside component) ----
     const sdkTokenRef = useRef<string | null>(null);
@@ -157,6 +173,14 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
 
     const [ready, setReady] = useState(false);
     const [recording, setRecording] = useState(false);
+    const [auth, setAuth] = useState<StoredAuth>(initialAuth);
+    const userTokenRef = useRef<string | null>(initialAuth?.token ?? null);
+    const [showLogin, setShowLogin] = useState(false);
+    const [loginEmail, setLoginEmail] = useState(initialAuth?.email ?? "");
+    const [loginToken, setLoginToken] = useState(initialAuth?.token ?? "");
+    const [loginError, setLoginError] = useState<string | null>(null);
+    const [isLoggingIn, setIsLoggingIn] = useState(false);
+    const disableLogin = isLoggingIn || !loginEmail.trim() || !loginToken.trim();
 
     // keep manual-attach ctx in sync so attachAxios() sees live refs
     useEffect(() => {
@@ -165,6 +189,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
             getSid: () => sessionIdRef.current,
             getAid: () => currentAidRef.current,
             getToken: () => sdkTokenRef.current,
+            getUserToken: () => userTokenRef.current,
             getFetch: () => (origFetchRef.current ?? window.fetch.bind(window)),
             hasReqMarked: hasReqMarkedRef.current,
         };
@@ -172,6 +197,68 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
             __reproCtx = null;
         };
     }, [base]);
+
+    useEffect(() => {
+        userTokenRef.current = auth?.token ?? null;
+        if (typeof window !== "undefined") {
+            try {
+                if (auth) {
+                    window.localStorage.setItem(storageKey, JSON.stringify(auth));
+                } else {
+                    window.localStorage.removeItem(storageKey);
+                }
+            } catch {
+                /* ignore storage failures */
+            }
+        }
+    }, [auth, storageKey]);
+
+    const requireAuth = () => {
+        if (!auth) {
+            setShowLogin(true);
+            return false;
+        }
+        return true;
+    };
+
+    async function login(email: string, token: string) {
+        setIsLoggingIn(true);
+        setLoginError(null);
+        try {
+            const resp = await fetch(`${base}/v1/apps/${appId}/users/login`, {
+                method: "POST",
+                headers: {
+                    Accept: "application/json",
+                    "Content-Type": "application/json",
+                    "x-app-user-token": token,
+                    [INTERNAL_HEADER]: "1",
+                },
+                body: JSON.stringify({ email, token }),
+            });
+            if (!resp.ok) {
+                throw new Error(`Login failed (${resp.status})`);
+            }
+            const data = await resp.json();
+            setAuth({ email, token, data });
+            setShowLogin(false);
+        } catch (err: any) {
+            setLoginError(err?.message || "Unable to login");
+        } finally {
+            setIsLoggingIn(false);
+        }
+    }
+
+    function handleLoginSubmit(evt: React.FormEvent) {
+        evt.preventDefault();
+        if (disableLogin) return;
+        login(loginEmail.trim(), loginToken.trim());
+    }
+
+    useEffect(() => {
+        if (!showLogin) {
+            setLoginError(null);
+        }
+    }, [showLogin]);
 
     // ---- bootstrap once ----
     useEffect(() => {
@@ -214,6 +301,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                     "Content-Type": "application/json",
                     "Content-Encoding": "gzip",
                     "Authorization": `Bearer ${token}`,
+                    ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
                     [INTERNAL_HEADER]: "1",
                 },
                 body: gz,
@@ -307,6 +395,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                 headers: {
                     "Content-Type": "application/json",
                     "Authorization": `Bearer ${token}`,
+                    ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
                     [INTERNAL_HEADER]: "1",
                 },
                 body: JSON.stringify({ ...envelope, seq }), // ensure seq matches piece
@@ -366,6 +455,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                         headers: {
                             "Content-Type": "application/json",
                             Authorization: `Bearer ${sdkTokenRef.current}`,
+                            ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
                             [INTERNAL_HEADER]: "1",
                         },
                         body: JSON.stringify({
@@ -411,15 +501,24 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
         if (!sdkTokenRef.current || recording) return;
 
         // 1) start session
+        if (!requireAuth()) return;
+
         const r = await fetch(`${base}/v1/sessions`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
                 Authorization: `Bearer ${sdkTokenRef.current}`,
+                ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
             },
             body: JSON.stringify({ clientTime: nowServer() }),
         });
-        if (!r.ok) return;
+        if (!r.ok) {
+            if (r.status === 401) {
+                setAuth(null);
+                setShowLogin(true);
+            }
+            return;
+        }
         const sess = (await r.json()) as { sessionId: string; clockOffsetMs: number };
         sessionIdRef.current = sess.sessionId;                 // <-- MISSING, add this
         offsetRef.current = Number(sess.clockOffsetMs || 0);
@@ -478,6 +577,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                             headers: {
                                 "Content-Type": "application/json",
                                 Authorization: `Bearer ${sdkTokenRef.current}`,
+                                ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
                                 [INTERNAL_HEADER]: "1",
                             },
                             body: JSON.stringify({
@@ -544,6 +644,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                     headers: {
                         "Content-Type": "application/json",
                         Authorization: `Bearer ${sdkTokenRef.current}`,
+                        ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
                         [INTERNAL_HEADER]: "1",
                     },
                     body: JSON.stringify({
@@ -627,6 +728,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                     headers: {
                         "Content-Type": "application/json",
                         Authorization: `Bearer ${token}`,
+                        ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
                         [INTERNAL_HEADER]: "1",
                     },
                     body: JSON.stringify({
@@ -653,6 +755,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                 headers: {
                     "Content-Type": "application/json",
                     Authorization: `Bearer ${token}`,
+                    ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
                     [INTERNAL_HEADER]: "1",
                 },
                 body: JSON.stringify({ notes: "" }),
@@ -678,29 +781,208 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
 
     // ---- UI (floating button) ----
     const btnLabel = recording ? (button?.text ?? "Stop & Report") : (button?.text ?? "Record");
+    const loginLabel = "Authenticate to Record";
+
+    const buttonBaseStyle: React.CSSProperties = {
+        position: "fixed",
+        right: 16,
+        bottom: 16,
+        zIndex: 2147483647,
+        padding: "12px 22px",
+        borderRadius: 4,
+        border: "1px solid #d1d5db",
+        background: "#f4f5f7",
+        cursor: "pointer",
+        fontFamily: "ui-sans-serif, system-ui, -apple-system",
+        fontSize: "14px",
+        fontWeight: 600,
+        color: "#1f2933",
+        boxShadow: "0 14px 24px rgba(15, 23, 42, 0.16)",
+        transition: "transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease",
+    };
+
+    const recordButtonStyle: React.CSSProperties = {
+        ...buttonBaseStyle,
+        background: recording ? "#fbeaea" : "#f3f4f6",
+        borderColor: recording ? "#f5b8b8" : "#d1d5db",
+        color: recording ? "#9b1c1c" : "#1f2933",
+    };
+
+    const loginButtonStyle: React.CSSProperties = {
+        ...buttonBaseStyle,
+        background: "#ffffff",
+        borderColor: "#d1d5db",
+        color: "#1f2933",
+    };
+
+    const modalOverlayStyle: React.CSSProperties = {
+        position: "fixed",
+        inset: 0,
+        background: "rgba(15, 23, 42, 0.38)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        zIndex: 2147483648,
+        padding: 16,
+    };
+
+    const modalStyle: React.CSSProperties = {
+        width: "100%",
+        maxWidth: 360,
+        background: "#ffffff",
+        borderRadius: 12,
+        boxShadow: "0 20px 40px rgba(15, 23, 42, 0.25)",
+        padding: "24px 24px 20px",
+        fontFamily: "ui-sans-serif, system-ui, -apple-system",
+    };
+
+    const labelStyle: React.CSSProperties = {
+        display: "block",
+        fontSize: 13,
+        fontWeight: 600,
+        color: "#111827",
+        marginBottom: 6,
+    };
+
+    const inputStyle: React.CSSProperties = {
+        width: "100%",
+        padding: "10px 12px",
+        borderRadius: 6,
+        border: "1px solid #d1d5db",
+        fontSize: 14,
+        marginBottom: 14,
+        boxSizing: "border-box",
+        fontFamily: "inherit",
+    };
 
     return (
         <>
             {children}
-            {ready && (
+            {ready && auth && (
                 <button
                     data-repro-internal="1"
                     onClick={() => (recording ? stop() : start())}
-                    style={{
-                        position: "fixed",
-                        right: 16,
-                        bottom: 16,
-                        zIndex: 2147483647,
-                        padding: "10px 14px",
-                        borderRadius: 12,
-                        border: "1px solid #ccc",
-                        background: recording ? "#ffe5e5" : "#e5f6ff",
-                        cursor: "pointer",
-                        fontFamily: "ui-sans-serif, system-ui, -apple-system",
-                    }}
+                    style={recordButtonStyle}
                 >
                     {btnLabel}
                 </button>
+            )}
+            {ready && !auth && (
+                <button
+                    data-repro-internal="1"
+                    onClick={() => {
+                        setLoginError(null);
+                        setShowLogin(true);
+                    }}
+                    style={loginButtonStyle}
+                >
+                    {loginLabel}
+                </button>
+            )}
+            {showLogin && (
+                <div
+                    data-repro-internal="1"
+                    style={modalOverlayStyle}
+                    onClick={(evt) => {
+                        if (evt.target === evt.currentTarget && !isLoggingIn) {
+                            setShowLogin(false);
+                        }
+                    }}
+                >
+                    <div data-repro-internal="1" style={modalStyle}>
+                        <h3 style={{ margin: 0, marginBottom: 12, fontSize: 18, color: "#0f172a" }}>
+                            Authenticate to start recording
+                        </h3>
+                        <form onSubmit={handleLoginSubmit}>
+                            <label style={labelStyle} htmlFor="repro-login-email">
+                                Email
+                            </label>
+                            <input
+                                id="repro-login-email"
+                                data-repro-internal="1"
+                                style={inputStyle}
+                                type="email"
+                                value={loginEmail}
+                                placeholder="user@example.com"
+                                onChange={(evt) => {
+                                    setLoginEmail(evt.target.value);
+                                    setLoginError(null);
+                                }}
+                                autoComplete="email"
+                                required
+                            />
+                            <label style={labelStyle} htmlFor="repro-login-token">
+                                Token
+                            </label>
+                            <input
+                                id="repro-login-token"
+                                data-repro-internal="1"
+                                style={inputStyle}
+                                type="text"
+                                value={loginToken}
+                                placeholder="Paste your access token"
+                                onChange={(evt) => {
+                                    setLoginToken(evt.target.value);
+                                    setLoginError(null);
+                                }}
+                                autoComplete="off"
+                                required
+                            />
+                            {loginError && (
+                                <div
+                                    style={{
+                                        color: "#b91c1c",
+                                        background: "#fee2e2",
+                                        borderRadius: 8,
+                                        padding: "8px 12px",
+                                        fontSize: 13,
+                                        marginBottom: 12,
+                                    }}
+                                >
+                                    {loginError}
+                                </div>
+                            )}
+                            <div style={{ display: "flex", justifyContent: "flex-end", gap: 12 }}>
+                                <button
+                                    type="button"
+                                    data-repro-internal="1"
+                                    onClick={() => {
+                                        if (!isLoggingIn) setShowLogin(false);
+                                    }}
+                                    style={{
+                                        padding: "10px 16px",
+                                        borderRadius: 6,
+                                        border: "1px solid transparent",
+                                        background: "transparent",
+                                        color: "#4b5563",
+                                        fontWeight: 600,
+                                        cursor: isLoggingIn ? "not-allowed" : "pointer",
+                                    }}
+                                    disabled={isLoggingIn}
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    type="submit"
+                                    data-repro-internal="1"
+                                    style={{
+                                        padding: "10px 16px",
+                                        borderRadius: 6,
+                                        border: "none",
+                                        background: disableLogin ? "#d1d5db" : "#2563eb",
+                                        color: disableLogin ? "#6b7280" : "#ffffff",
+                                        fontWeight: 700,
+                                        cursor: disableLogin ? "not-allowed" : "pointer",
+                                        transition: "background 0.2s ease",
+                                    }}
+                                    disabled={disableLogin}
+                                >
+                                    {isLoggingIn ? "Signing in..." : "Sign in"}
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
             )}
         </>
     );
