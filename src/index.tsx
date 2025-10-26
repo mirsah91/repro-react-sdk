@@ -60,6 +60,7 @@ async function getJSON<T>(url: string) {
 }
 
 const INTERNAL_HEADER = "X-Repro-Internal";
+const REQUEST_START_HEADER = "X-Bug-Request-Start";
 
 // --- manual Axios attach support (module-scoped ctx) ---
 type ReproCtx = {
@@ -88,10 +89,22 @@ export function attachAxios(axiosInstance: any) {
         const isInternal = url.startsWith(ctx.base);
         const isSdkInternal = !!config.headers?.[INTERNAL_HEADER];
 
+        if (!config.headers) config.headers = {};
+        const setHeader = (key: string, value: string) => {
+            if (!config.headers) return;
+            if (typeof (config.headers as any).set === "function") {
+                (config.headers as any).set(key, value);
+            } else {
+                (config.headers as any)[key] = value;
+            }
+        };
+        if (!isSdkInternal) {
+            const requestStart = nowServer();
+            setHeader(REQUEST_START_HEADER, String(requestStart));
+        }
         if (sid && aid && !isInternal && !isSdkInternal) {
-            config.headers = config.headers || {};
-            config.headers["X-Bug-Session-Id"] = sid;
-            config.headers["X-Bug-Action-Id"] = aid;
+            setHeader("X-Bug-Session-Id", sid);
+            setHeader("X-Bug-Action-Id", aid);
         }
         return config;
     });
@@ -549,12 +562,16 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                 hdrsIn.has(INTERNAL_HEADER) || hdrsIn.has(INTERNAL_HEADER.toLowerCase());
 
             // inject bug headers for app requests only (not our API or SDK-internal posts)
+            const headers = new Headers(init.headers || {});
+            if (!isSdkInternal) {
+                const requestStart = nowServer();
+                headers.set(REQUEST_START_HEADER, String(requestStart));
+            }
             if (sessionIdRef.current && currentAidRef.current && !isInternal && !isSdkInternal) {
-                const headers = new Headers(init.headers || {});
                 headers.set("X-Bug-Session-Id", sessionIdRef.current);
                 headers.set("X-Bug-Action-Id", currentAidRef.current);
-                init.headers = headers;
             }
+            init.headers = headers;
 
             // always call ORIGINAL fetch to avoid recursion
             const res = await origFetchRef.current!(input as any, init);
