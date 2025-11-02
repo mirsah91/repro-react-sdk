@@ -13,6 +13,7 @@ import { gzip } from 'pako';
 
 type Props = {
     appId: string;
+    tenantId: string;
     apiBase?: string; // default: http://localhost:4000
     children: React.ReactNode;
     button?: { text?: string }; // optional override label
@@ -53,14 +54,15 @@ const offsetRef = { current: 0 };              // ms to add to client time
 const nowServer = () => now() + (offsetRef.current || 0);
 
 
-async function getJSON<T>(url: string) {
-    const r = await fetch(url);
+async function getJSON<T>(url: string, headers?: HeadersInit) {
+    const r = await fetch(url, headers ? { headers } : undefined);
     if (!r.ok) throw new Error(`${r.status}`);
     return (await r.json()) as T;
 }
 
 const INTERNAL_HEADER = "X-Repro-Internal";
 const REQUEST_START_HEADER = "X-Bug-Request-Start";
+const TENANT_HEADER = "x-tenant-id";
 
 // --- manual Axios attach support (module-scoped ctx) ---
 type ReproCtx = {
@@ -69,6 +71,8 @@ type ReproCtx = {
     getAid: () => string | null;
     getToken: () => string | null;
     getUserToken: () => string | null;
+    getUserPassword: () => string | null;
+    getTenantId: () => string | null;
     getFetch: () => typeof window.fetch;
     hasReqMarked: Set<string>;
 };
@@ -85,6 +89,7 @@ export function attachAxios(axiosInstance: any) {
 
         const sid = ctx.getSid();
         const aid = ctx.getAid();
+        const tenantId = ctx.getTenantId();
         const url = `${config.baseURL || ""}${config.url || ""}`;
         const isInternal = url.startsWith(ctx.base);
         const isSdkInternal = !!config.headers?.[INTERNAL_HEADER];
@@ -101,6 +106,9 @@ export function attachAxios(axiosInstance: any) {
         if (!isSdkInternal) {
             const requestStart = nowServer();
             setHeader(REQUEST_START_HEADER, String(requestStart));
+        }
+        if (isInternal && tenantId) {
+            setHeader(TENANT_HEADER, tenantId);
         }
         if (sid && aid && !isInternal && !isSdkInternal) {
             setHeader("X-Bug-Session-Id", sid);
@@ -120,26 +128,8 @@ export function attachAxios(axiosInstance: any) {
 
             const sid = ctx.getSid();
             const aid = ctx.getAid();
-            const token = ctx.getToken();
-            const userToken = ctx.getUserToken();
-
-            if (!isInternal && !isSdkInternal && sid && aid && token && !ctx.hasReqMarked.has(aid)) {
+            if (!isInternal && !isSdkInternal && sid && aid && !ctx.hasReqMarked.has(aid)) {
                 ctx.hasReqMarked.add(aid);
-                try {
-                    await ctx.getFetch()(`${ctx.base}/v1/sessions/${sid}/events`, {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json",
-                            Authorization: `Bearer ${token}`,
-                            ...(userToken ? { "x-app-user-token": userToken } : {}),
-                            [INTERNAL_HEADER]: "1",
-                        },
-                        body: JSON.stringify({
-                            seq: nowServer(),
-                            events: [{ type: "action", aid, tStart: nowServer(), tEnd: nowServer(), hasReq: true, ui: {} }],
-                        }),
-                    } as RequestInit);
-                } catch {}
             }
             return resp;
         },
@@ -149,17 +139,31 @@ export function attachAxios(axiosInstance: any) {
 
 type ActionMeta = { tStart: number; label?: string };
 
-export function ReproProvider({ appId, apiBase, children, button }: Props) {
+export function ReproProvider({ appId, tenantId, apiBase, children, button }: Props) {
     const base = apiBase || "http://localhost:4000";
-    type StoredAuth = { email: string; token: string; data: any } | null;
-    const storageKey = `repro-auth-${appId}`;
+    type StoredAuth = { email: string; password: string; data: any } | null;
+    const storageKey = `repro-auth-${tenantId}-${appId}`;
 
     const initialAuth: StoredAuth = (() => {
         if (typeof window === "undefined") return null;
         try {
             const raw = window.localStorage.getItem(storageKey);
             if (!raw) return null;
-            return JSON.parse(raw) as StoredAuth;
+            const parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== "object") return null;
+            const email = typeof parsed.email === "string" ? parsed.email : null;
+            const password =
+                typeof parsed.password === "string"
+                    ? parsed.password
+                    : typeof parsed.token === "string"
+                    ? parsed.token
+                    : null;
+            if (!email || !password) return null;
+            return {
+                email,
+                password,
+                data: (parsed as any).data,
+            };
         } catch {
             return null;
         }
@@ -187,32 +191,49 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
     const [ready, setReady] = useState(false);
     const [recording, setRecording] = useState(false);
     const [auth, setAuth] = useState<StoredAuth>(initialAuth);
-    const userTokenRef = useRef<string | null>(initialAuth?.token ?? null);
+    const userPasswordRef = useRef<string | null>(initialAuth?.password ?? null);
+    const tenantIdRef = useRef<string>(tenantId);
     const [showLogin, setShowLogin] = useState(false);
     const [loginEmail, setLoginEmail] = useState(initialAuth?.email ?? "");
-    const [loginToken, setLoginToken] = useState(initialAuth?.token ?? "");
+    const [loginPassword, setLoginPassword] = useState(initialAuth?.password ?? "");
     const [loginError, setLoginError] = useState<string | null>(null);
     const [isLoggingIn, setIsLoggingIn] = useState(false);
-    const disableLogin = isLoggingIn || !loginEmail.trim() || !loginToken.trim();
+    const disableLogin = isLoggingIn || !loginEmail.trim() || !loginPassword.trim();
+
+    const addTenantHeader = (headers: Record<string, string>) => {
+        const tenant = tenantIdRef.current;
+        return tenant ? { ...headers, [TENANT_HEADER]: tenant } : headers;
+    };
+
+    const setTenantOnHeaders = (headers: Headers) => {
+        const tenant = tenantIdRef.current;
+        if (tenant) headers.set(TENANT_HEADER, tenant);
+    };
 
     // keep manual-attach ctx in sync so attachAxios() sees live refs
+    useEffect(() => {
+        tenantIdRef.current = tenantId;
+    }, [tenantId]);
+
     useEffect(() => {
         __reproCtx = {
             base,
             getSid: () => sessionIdRef.current,
             getAid: () => currentAidRef.current,
-            getToken: () => sdkTokenRef.current,
-            getUserToken: () => userTokenRef.current,
+        getToken: () => sdkTokenRef.current,
+        getUserToken: () => userPasswordRef.current,
+        getUserPassword: () => userPasswordRef.current,
+            getTenantId: () => tenantIdRef.current,
             getFetch: () => (origFetchRef.current ?? window.fetch.bind(window)),
             hasReqMarked: hasReqMarkedRef.current,
         };
         return () => {
             __reproCtx = null;
         };
-    }, [base]);
+    }, [base, tenantId]);
 
     useEffect(() => {
-        userTokenRef.current = auth?.token ?? null;
+        userPasswordRef.current = auth?.password ?? null;
         if (typeof window !== "undefined") {
             try {
                 if (auth) {
@@ -234,25 +255,25 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
         return true;
     };
 
-    async function login(email: string, token: string) {
+    async function login(email: string, password: string) {
         setIsLoggingIn(true);
         setLoginError(null);
         try {
             const resp = await fetch(`${base}/v1/apps/${appId}/users/login`, {
                 method: "POST",
-                headers: {
+                headers: addTenantHeader({
                     Accept: "application/json",
                     "Content-Type": "application/json",
-                    "x-app-user-token": token,
                     [INTERNAL_HEADER]: "1",
-                },
-                body: JSON.stringify({ email, token }),
+                }),
+                body: JSON.stringify({ email, password }),
             });
             if (!resp.ok) {
                 throw new Error(`Login failed (${resp.status})`);
             }
             const data = await resp.json();
-            setAuth({ email, token, data });
+            setAuth({ email, password, data });
+            setLoginPassword("");
             setShowLogin(false);
         } catch (err: any) {
             setLoginError(err?.message || "Unable to login");
@@ -264,7 +285,16 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
     function handleLoginSubmit(evt: React.FormEvent) {
         evt.preventDefault();
         if (disableLogin) return;
-        login(loginEmail.trim(), loginToken.trim());
+        login(loginEmail.trim(), loginPassword.trim());
+    }
+
+    function logout() {
+        if (recording) {
+            void stop();
+        }
+        setAuth(null);
+        setLoginPassword("");
+        setShowLogin(false);
     }
 
     useEffect(() => {
@@ -279,7 +309,8 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
         (async () => {
             try {
                 const resp = await getJSON<{ enabled: boolean; sdkToken?: string }>(
-                    `${base}/v1/sdk/bootstrap?appId=${encodeURIComponent(appId)}`
+                    `${base}/v1/sdk/bootstrap?appId=${encodeURIComponent(appId)}`,
+                    addTenantHeader({ [INTERNAL_HEADER]: "1" })
                 );
                 if (mounted && resp.enabled && resp.sdkToken) {
                     sdkTokenRef.current = resp.sdkToken;
@@ -310,13 +341,13 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
             const gz = gzip(json); // Uint8Array
             const r = await (origFetchRef.current ?? window.fetch)(`${baseUrl}/v1/sessions/${sid}/events`, {
                 method: "POST",
-                headers: {
+                headers: addTenantHeader({
                     "Content-Type": "application/json",
                     "Content-Encoding": "gzip",
-                    "Authorization": `Bearer ${token}`,
-                    ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
+                    Authorization: `Bearer ${token}`,
+                    ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
                     [INTERNAL_HEADER]: "1",
-                },
+                }),
                 body: gz,
             });
             if (r.status === 413) return 'too_large';
@@ -405,12 +436,12 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
         try {
             const r = await (origFetchRef.current ?? window.fetch)(`${baseUrl}/v1/sessions/${sid}/events`, {
                 method: "POST",
-                headers: {
+                headers: addTenantHeader({
                     "Content-Type": "application/json",
-                    "Authorization": `Bearer ${token}`,
-                    ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
+                    Authorization: `Bearer ${token}`,
+                    ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
                     [INTERNAL_HEADER]: "1",
-                },
+                }),
                 body: JSON.stringify({ ...envelope, seq }), // ensure seq matches piece
             });
             if (r.status === 413) return 'too_large';
@@ -437,6 +468,11 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
             const url = `${config.baseURL || ""}${config.url || ""}`;
             const isInternal = url.startsWith(base);
             const isSdkInternal = config.headers?.[INTERNAL_HEADER] != null;
+
+            if (isInternal && tenantIdRef.current) {
+                config.headers = config.headers || {};
+                config.headers[TENANT_HEADER] = tenantIdRef.current;
+            }
 
             if (sid && aid && !isInternal && !isSdkInternal) {
                 config.headers = config.headers || {};
@@ -465,12 +501,12 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                     // use ORIGINAL fetch to avoid recursion
                     await origFetchRef.current!(`${base}/v1/sessions/${sessionIdRef.current}/events`, {
                         method: "POST",
-                        headers: {
+                        headers: addTenantHeader({
                             "Content-Type": "application/json",
                             Authorization: `Bearer ${sdkTokenRef.current}`,
-                            ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
+                            ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
                             [INTERNAL_HEADER]: "1",
-                        },
+                        }),
                         body: JSON.stringify({
                             seq: nowServer(),
                             events: [
@@ -518,16 +554,17 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
 
         const r = await fetch(`${base}/v1/sessions`, {
             method: "POST",
-            headers: {
+            headers: addTenantHeader({
                 "Content-Type": "application/json",
                 Authorization: `Bearer ${sdkTokenRef.current}`,
-                ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
-            },
+                ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
+            }),
             body: JSON.stringify({ clientTime: nowServer() }),
         });
         if (!r.ok) {
             if (r.status === 401) {
                 setAuth(null);
+                setLoginPassword("");
                 setShowLogin(true);
             }
             return;
@@ -563,6 +600,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
 
             // inject bug headers for app requests only (not our API or SDK-internal posts)
             const headers = new Headers(init.headers || {});
+            setTenantOnHeaders(headers);
             if (!isSdkInternal) {
                 const requestStart = nowServer();
                 headers.set(REQUEST_START_HEADER, String(requestStart));
@@ -582,40 +620,9 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                 !isSdkInternal &&
                 sessionIdRef.current &&
                 currentAidRef.current &&
-                sdkTokenRef.current &&
                 !hasReqMarkedRef.current.has(currentAidRef.current)
             ) {
                 hasReqMarkedRef.current.add(currentAidRef.current);
-                try {
-                    await origFetchRef.current!(
-                        `${base}/v1/sessions/${sessionIdRef.current}/events`,
-                        {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/json",
-                                Authorization: `Bearer ${sdkTokenRef.current}`,
-                                ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
-                                [INTERNAL_HEADER]: "1",
-                            },
-                            body: JSON.stringify({
-                                seq: nowServer(),
-                                events: [
-                                    {
-                                        type: "action",
-                                        aid: currentAidRef.current,
-                                        label: lastActionLabelRef.current,
-                                        tStart: nowServer(),
-                                        tEnd: nowServer(),
-                                        hasReq: true,
-                                        ui: {},
-                                    },
-                                ],
-                            }),
-                        }
-                    );
-                } catch {
-                    /* ignore in MVP */
-                }
             }
 
             return res;
@@ -658,12 +665,12 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                 `${base}/v1/sessions/${sessionIdRef.current}/events`,
                 {
                     method: "POST",
-                    headers: {
+                    headers: addTenantHeader({
                         "Content-Type": "application/json",
                         Authorization: `Bearer ${sdkTokenRef.current}`,
-                        ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
+                        ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
                         [INTERNAL_HEADER]: "1",
-                    },
+                    }),
                     body: JSON.stringify({
                         seq: t,
                         events: [
@@ -742,12 +749,12 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
 
                 await origFetch(`${base}/v1/sessions/${sid}/events`, {
                     method: "POST",
-                    headers: {
+                    headers: addTenantHeader({
                         "Content-Type": "application/json",
                         Authorization: `Bearer ${token}`,
-                        ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
+                        ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
                         [INTERNAL_HEADER]: "1",
-                    },
+                    }),
                     body: JSON.stringify({
                         type: "rrweb",
                         seq,
@@ -769,12 +776,12 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
         try {
             const res = await origFetch(`${base}/v1/sessions/${sid}/finish`, {
                 method: "POST",
-                headers: {
+                headers: addTenantHeader({
                     "Content-Type": "application/json",
                     Authorization: `Bearer ${token}`,
-                    ...(userTokenRef.current ? { "x-app-user-token": userTokenRef.current } : {}),
+                    ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
                     [INTERNAL_HEADER]: "1",
-                },
+                }),
                 body: JSON.stringify({ notes: "" }),
             });
             const fin = await res.json();
@@ -820,6 +827,7 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
 
     const recordButtonStyle: React.CSSProperties = {
         ...buttonBaseStyle,
+        bottom: auth ? 72 : 16,
         background: recording ? "#fbeaea" : "#f3f4f6",
         borderColor: recording ? "#f5b8b8" : "#d1d5db",
         color: recording ? "#9b1c1c" : "#1f2933",
@@ -830,6 +838,16 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
         background: "#ffffff",
         borderColor: "#d1d5db",
         color: "#1f2933",
+    };
+
+    const logoutButtonStyle: React.CSSProperties = {
+        ...buttonBaseStyle,
+        padding: "8px 16px",
+        fontSize: "12px",
+        fontWeight: 600,
+        background: "#ffffff",
+        borderColor: "#d1d5db",
+        color: "#4b5563",
     };
 
     const modalOverlayStyle: React.CSSProperties = {
@@ -876,13 +894,23 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
         <>
             {children}
             {ready && auth && (
-                <button
-                    data-repro-internal="1"
-                    onClick={() => (recording ? stop() : start())}
-                    style={recordButtonStyle}
-                >
-                    {btnLabel}
-                </button>
+                <>
+                    <button
+                        data-repro-internal="1"
+                        onClick={() => (recording ? stop() : start())}
+                        style={recordButtonStyle}
+                    >
+                        {btnLabel}
+                    </button>
+                    <button
+                        data-repro-internal="1"
+                        onClick={logout}
+                        style={logoutButtonStyle}
+                        type="button"
+                    >
+                        Log out
+                    </button>
+                </>
             )}
             {ready && !auth && (
                 <button
@@ -928,21 +956,21 @@ export function ReproProvider({ appId, apiBase, children, button }: Props) {
                                 autoComplete="email"
                                 required
                             />
-                            <label style={labelStyle} htmlFor="repro-login-token">
-                                Token
+                            <label style={labelStyle} htmlFor="repro-login-password">
+                                Password
                             </label>
                             <input
-                                id="repro-login-token"
+                                id="repro-login-password"
                                 data-repro-internal="1"
                                 style={inputStyle}
-                                type="text"
-                                value={loginToken}
-                                placeholder="Paste your access token"
+                                type="password"
+                                value={loginPassword}
+                                placeholder="Enter your workspace password"
                                 onChange={(evt) => {
-                                    setLoginToken(evt.target.value);
+                                    setLoginPassword(evt.target.value);
                                     setLoginError(null);
                                 }}
-                                autoComplete="off"
+                                autoComplete="current-password"
                                 required
                             />
                             {loginError && (
