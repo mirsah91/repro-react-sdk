@@ -128,28 +128,8 @@ export function attachAxios(axiosInstance: any) {
 
             const sid = ctx.getSid();
             const aid = ctx.getAid();
-            const token = ctx.getToken();
-            const userToken = ctx.getUserToken();
-            const tenantId = ctx.getTenantId();
-
-            if (!isInternal && !isSdkInternal && sid && aid && token && !ctx.hasReqMarked.has(aid)) {
+            if (!isInternal && !isSdkInternal && sid && aid && !ctx.hasReqMarked.has(aid)) {
                 ctx.hasReqMarked.add(aid);
-                try {
-                    await ctx.getFetch()(`${ctx.base}/v1/sessions/${sid}/events`, {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json",
-                            Authorization: `Bearer ${token}`,
-                            ...(userToken ? { "x-app-user-token": userToken } : {}),
-                            ...(tenantId ? { [TENANT_HEADER]: tenantId } : {}),
-                            [INTERNAL_HEADER]: "1",
-                        },
-                        body: JSON.stringify({
-                            seq: nowServer(),
-                            events: [{ type: "action", aid, tStart: nowServer(), tEnd: nowServer(), hasReq: true, ui: {} }],
-                        }),
-                    } as RequestInit);
-                } catch {}
             }
             return resp;
         },
@@ -640,40 +620,9 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
                 !isSdkInternal &&
                 sessionIdRef.current &&
                 currentAidRef.current &&
-                sdkTokenRef.current &&
                 !hasReqMarkedRef.current.has(currentAidRef.current)
             ) {
                 hasReqMarkedRef.current.add(currentAidRef.current);
-                try {
-                    await origFetchRef.current!(
-                        `${base}/v1/sessions/${sessionIdRef.current}/events`,
-                        {
-                            method: "POST",
-                            headers: addTenantHeader({
-                                "Content-Type": "application/json",
-                                Authorization: `Bearer ${sdkTokenRef.current}`,
-                                ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
-                                [INTERNAL_HEADER]: "1",
-                            }),
-                            body: JSON.stringify({
-                                seq: nowServer(),
-                                events: [
-                                    {
-                                        type: "action",
-                                        aid: currentAidRef.current,
-                                        label: lastActionLabelRef.current,
-                                        tStart: nowServer(),
-                                        tEnd: nowServer(),
-                                        hasReq: true,
-                                        ui: {},
-                                    },
-                                ],
-                            }),
-                        }
-                    );
-                } catch {
-                    /* ignore in MVP */
-                }
             }
 
             return res;
