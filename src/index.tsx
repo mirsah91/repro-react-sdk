@@ -292,10 +292,15 @@ type StoredAuth = {
                 throw new Error(`Login failed (${resp.status})`);
             }
             const data = await resp.json();
-            const accessToken =
+            const accessTokenFromUser =
                 typeof data?.user?.accessToken === "string"
                     ? (data.user.accessToken as string).trim()
                     : null;
+            const accessTokenFromData =
+                typeof data?.accessToken === "string"
+                    ? (data.accessToken as string).trim()
+                    : null;
+            const accessToken = accessTokenFromUser || accessTokenFromData;
             if (!accessToken) {
                 throw new Error("Login response did not include an access token.");
             }
