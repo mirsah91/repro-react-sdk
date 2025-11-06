@@ -1,6 +1,6 @@
 {
   "name": "repro-react",
-  "version": "0.0.25",
+  "version": "0.0.26",
   "description": "Repro React SDK (MVP)",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
