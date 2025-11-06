@@ -107,8 +107,21 @@ export function attachAxios(axiosInstance: any) {
             const requestStart = nowServer();
             setHeader(REQUEST_START_HEADER, String(requestStart));
         }
-        if (isInternal && tenantId) {
-            setHeader(TENANT_HEADER, tenantId);
+        const sdkToken = ctx.getToken();
+        const userToken = ctx.getUserToken();
+        if (isInternal) {
+            if (tenantId) {
+                setHeader(TENANT_HEADER, tenantId);
+            }
+            if (sdkToken && !(config.headers as any)["x-sdk-token"]) {
+                setHeader("x-sdk-token", sdkToken);
+            }
+            const existingAuth =
+                (config.headers as any)?.Authorization ??
+                (config.headers as any)?.authorization;
+            if (userToken && !existingAuth) {
+                setHeader("Authorization", `Bearer ${userToken}`);
+            }
         }
         if (sid && aid && !isInternal && !isSdkInternal) {
             setHeader("X-Bug-Session-Id", sid);
@@ -141,7 +154,12 @@ type ActionMeta = { tStart: number; label?: string };
 
 export function ReproProvider({ appId, tenantId, apiBase, children, button }: Props) {
     const base = apiBase || "http://localhost:4000";
-    type StoredAuth = { email: string; password: string; data: any } | null;
+type StoredAuth = {
+    email: string;
+    password?: string | null;
+    token: string;
+    data: any;
+} | null;
     const storageKey = `repro-auth-${tenantId}-${appId}`;
 
     const initialAuth: StoredAuth = (() => {
@@ -152,16 +170,16 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
             const parsed = JSON.parse(raw);
             if (!parsed || typeof parsed !== "object") return null;
             const email = typeof parsed.email === "string" ? parsed.email : null;
-            const password =
-                typeof parsed.password === "string"
-                    ? parsed.password
-                    : typeof parsed.token === "string"
-                    ? parsed.token
+            const password = typeof parsed.password === "string" ? parsed.password : null;
+            const token =
+                typeof parsed.token === "string" && parsed.token.trim().length
+                    ? (parsed.token as string).trim()
                     : null;
-            if (!email || !password) return null;
+            if (!email || !token) return null;
             return {
                 email,
                 password,
+                token,
                 data: (parsed as any).data,
             };
         } catch {
@@ -192,6 +210,7 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
     const [recording, setRecording] = useState(false);
     const [auth, setAuth] = useState<StoredAuth>(initialAuth);
     const userPasswordRef = useRef<string | null>(initialAuth?.password ?? null);
+    const userTokenRef = useRef<string | null>(initialAuth?.token ?? null);
     const tenantIdRef = useRef<string>(tenantId);
     const [showLogin, setShowLogin] = useState(false);
     const [loginEmail, setLoginEmail] = useState(initialAuth?.email ?? "");
@@ -221,7 +240,7 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
             getSid: () => sessionIdRef.current,
             getAid: () => currentAidRef.current,
         getToken: () => sdkTokenRef.current,
-        getUserToken: () => userPasswordRef.current,
+        getUserToken: () => userTokenRef.current,
         getUserPassword: () => userPasswordRef.current,
             getTenantId: () => tenantIdRef.current,
             getFetch: () => (origFetchRef.current ?? window.fetch.bind(window)),
@@ -234,6 +253,7 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
 
     useEffect(() => {
         userPasswordRef.current = auth?.password ?? null;
+        userTokenRef.current = auth?.token ?? null;
         if (typeof window !== "undefined") {
             try {
                 if (auth) {
@@ -272,7 +292,19 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
                 throw new Error(`Login failed (${resp.status})`);
             }
             const data = await resp.json();
-            setAuth({ email, password, data });
+            const accessTokenFromUser =
+                typeof data?.user?.accessToken === "string"
+                    ? (data.user.accessToken as string).trim()
+                    : null;
+            const accessTokenFromData =
+                typeof data?.accessToken === "string"
+                    ? (data.accessToken as string).trim()
+                    : null;
+            const accessToken = accessTokenFromUser || accessTokenFromData;
+            if (!accessToken) {
+                throw new Error("Login response did not include an access token.");
+            }
+            setAuth({ email, password, token: accessToken, data });
             setLoginPassword("");
             setShowLogin(false);
         } catch (err: any) {
@@ -344,8 +376,8 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
                 headers: addTenantHeader({
                     "Content-Type": "application/json",
                     "Content-Encoding": "gzip",
-                    Authorization: `Bearer ${token}`,
-                    ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
+                    "x-sdk-token": token,
+                    ...(userTokenRef.current ? { Authorization: `Bearer ${userTokenRef.current}` } : {}),
                     [INTERNAL_HEADER]: "1",
                 }),
                 body: gz,
@@ -438,8 +470,8 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
                 method: "POST",
                 headers: addTenantHeader({
                     "Content-Type": "application/json",
-                    Authorization: `Bearer ${token}`,
-                    ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
+                    "x-sdk-token": token,
+                    ...(userTokenRef.current ? { Authorization: `Bearer ${userTokenRef.current}` } : {}),
                     [INTERNAL_HEADER]: "1",
                 }),
                 body: JSON.stringify({ ...envelope, seq }), // ensure seq matches piece
@@ -503,8 +535,8 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
                         method: "POST",
                         headers: addTenantHeader({
                             "Content-Type": "application/json",
-                            Authorization: `Bearer ${sdkTokenRef.current}`,
-                            ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
+                            "x-sdk-token": sdkTokenRef.current as string,
+                            ...(userTokenRef.current ? { Authorization: `Bearer ${userTokenRef.current}` } : {}),
                             [INTERNAL_HEADER]: "1",
                         }),
                         body: JSON.stringify({
@@ -556,8 +588,8 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
             method: "POST",
             headers: addTenantHeader({
                 "Content-Type": "application/json",
-                Authorization: `Bearer ${sdkTokenRef.current}`,
-                ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
+                "x-sdk-token": sdkTokenRef.current as string,
+                ...(userTokenRef.current ? { Authorization: `Bearer ${userTokenRef.current}` } : {}),
             }),
             body: JSON.stringify({ clientTime: nowServer() }),
         });
@@ -667,8 +699,8 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
                     method: "POST",
                     headers: addTenantHeader({
                         "Content-Type": "application/json",
-                        Authorization: `Bearer ${sdkTokenRef.current}`,
-                        ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
+                        "x-sdk-token": sdkTokenRef.current as string,
+                        ...(userTokenRef.current ? { Authorization: `Bearer ${userTokenRef.current}` } : {}),
                         [INTERNAL_HEADER]: "1",
                     }),
                     body: JSON.stringify({
@@ -751,8 +783,8 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
                     method: "POST",
                     headers: addTenantHeader({
                         "Content-Type": "application/json",
-                        Authorization: `Bearer ${token}`,
-                        ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
+                        "x-sdk-token": token,
+                        ...(userTokenRef.current ? { Authorization: `Bearer ${userTokenRef.current}` } : {}),
                         [INTERNAL_HEADER]: "1",
                     }),
                     body: JSON.stringify({
@@ -778,8 +810,8 @@ export function ReproProvider({ appId, tenantId, apiBase, children, button }: Pr
                 method: "POST",
                 headers: addTenantHeader({
                     "Content-Type": "application/json",
-                    Authorization: `Bearer ${token}`,
-                    ...(userPasswordRef.current ? { "x-app-user-token": userPasswordRef.current } : {}),
+                    "x-sdk-token": token,
+                    ...(userTokenRef.current ? { Authorization: `Bearer ${userTokenRef.current}` } : {}),
                     [INTERNAL_HEADER]: "1",
                 }),
                 body: JSON.stringify({ notes: "" }),
