@@ -63,6 +63,8 @@ async function getJSON<T>(url: string, headers?: HeadersInit) {
 const INTERNAL_HEADER = "X-Repro-Internal";
 const REQUEST_START_HEADER = "X-Bug-Request-Start";
 const TENANT_HEADER = "x-tenant-id";
+const NGROK_SKIP_HEADER = "ngrok-skip-browser-warning";
+const NGROK_SKIP_VALUE = "true";
 
 // --- manual Axios attach support (module-scoped ctx) ---
 type ReproCtx = {
@@ -110,6 +112,7 @@ export function attachAxios(axiosInstance: any) {
         const sdkToken = ctx.getToken();
         const userToken = ctx.getUserToken();
         if (isInternal) {
+            setHeader(NGROK_SKIP_HEADER, NGROK_SKIP_VALUE);
             if (tenantId) {
                 setHeader(TENANT_HEADER, tenantId);
             }
@@ -221,10 +224,20 @@ type StoredAuth = {
 
     const addTenantHeader = (headers: Record<string, string>) => {
         const tenant = tenantIdRef.current;
-        return tenant ? { ...headers, [TENANT_HEADER]: tenant } : headers;
+        const next: Record<string, string> = {
+            ...headers,
+            [NGROK_SKIP_HEADER]: NGROK_SKIP_VALUE,
+        };
+        if (tenant) {
+            next[TENANT_HEADER] = tenant;
+        }
+        return next;
     };
 
-    const setTenantOnHeaders = (headers: Headers) => {
+    const setTenantOnHeaders = (headers: Headers, isInternal?: boolean) => {
+        if (isInternal) {
+            headers.set(NGROK_SKIP_HEADER, NGROK_SKIP_VALUE);
+        }
         const tenant = tenantIdRef.current;
         if (tenant) headers.set(TENANT_HEADER, tenant);
     };
@@ -501,9 +514,12 @@ type StoredAuth = {
             const isInternal = url.startsWith(base);
             const isSdkInternal = config.headers?.[INTERNAL_HEADER] != null;
 
-            if (isInternal && tenantIdRef.current) {
+            if (isInternal) {
                 config.headers = config.headers || {};
-                config.headers[TENANT_HEADER] = tenantIdRef.current;
+                config.headers[NGROK_SKIP_HEADER] = NGROK_SKIP_VALUE;
+                if (tenantIdRef.current) {
+                    config.headers[TENANT_HEADER] = tenantIdRef.current;
+                }
             }
 
             if (sid && aid && !isInternal && !isSdkInternal) {
@@ -632,7 +648,7 @@ type StoredAuth = {
 
             // inject bug headers for app requests only (not our API or SDK-internal posts)
             const headers = new Headers(init.headers || {});
-            setTenantOnHeaders(headers);
+            setTenantOnHeaders(headers, isInternal);
             if (!isSdkInternal) {
                 const requestStart = nowServer();
                 headers.set(REQUEST_START_HEADER, String(requestStart));
