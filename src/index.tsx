@@ -240,6 +240,17 @@ type StoredAuth = {
     const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
     const copyStatusTimerRef = useRef<number | null>(null);
     const logoutInFlightRef = useRef(false);
+    const floatingContainerRef = useRef<HTMLDivElement | null>(null);
+    const dragStateRef = useRef<{
+        pointerId: number;
+        offsetX: number;
+        offsetY: number;
+        width: number;
+        height: number;
+    } | null>(null);
+    const [floatingPosition, setFloatingPosition] = useState<{ top: number; left: number } | null>(
+        null
+    );
     const clearCopyStatusTimer = () => {
         if (copyStatusTimerRef.current == null) return;
         if (typeof window !== "undefined") {
@@ -422,6 +433,38 @@ type StoredAuth = {
     useEffect(() => {
         return () => {
             clearCopyStatusTimer();
+        };
+    }, []);
+
+    useEffect(() => {
+        const handlePointerMove = (evt: PointerEvent) => {
+            const dragState = dragStateRef.current;
+            if (!dragState || dragState.pointerId !== evt.pointerId) return;
+            evt.preventDefault();
+            const newLeft = evt.clientX - dragState.offsetX;
+            const newTop = evt.clientY - dragState.offsetY;
+            const maxLeft = Math.max(8, (window.innerWidth || 0) - dragState.width - 8);
+            const maxTop = Math.max(8, (window.innerHeight || 0) - dragState.height - 8);
+            const clampedLeft = Math.min(Math.max(8, newLeft), maxLeft);
+            const clampedTop = Math.min(Math.max(8, newTop), maxTop);
+            setFloatingPosition({ top: clampedTop, left: clampedLeft });
+        };
+        const endDrag = (evt: PointerEvent) => {
+            const dragState = dragStateRef.current;
+            if (!dragState) return;
+            if (evt.pointerId !== dragState.pointerId) return;
+            dragStateRef.current = null;
+        };
+        const cancelDrag = () => {
+            dragStateRef.current = null;
+        };
+        window.addEventListener("pointermove", handlePointerMove);
+        window.addEventListener("pointerup", endDrag);
+        window.addEventListener("pointercancel", cancelDrag);
+        return () => {
+            window.removeEventListener("pointermove", handlePointerMove);
+            window.removeEventListener("pointerup", endDrag);
+            window.removeEventListener("pointercancel", cancelDrag);
         };
     }, []);
 
@@ -964,10 +1007,8 @@ type StoredAuth = {
     const btnLabel = recording ? (button?.text ?? "Stop & Report") : (button?.text ?? "Record");
     const loginLabel = "Authenticate to Record";
 
-    const floatingContainerStyle: React.CSSProperties = {
+    const floatingContainerBaseStyle: React.CSSProperties = {
         position: "fixed",
-        right: 16,
-        bottom: 16,
         zIndex: 2147483647,
         display: "flex",
         flexDirection: "column",
@@ -975,6 +1016,13 @@ type StoredAuth = {
         gap: 12,
         width: "100%",
         maxWidth: 360,
+    };
+    const floatingPositionStyle: React.CSSProperties = floatingPosition
+        ? { top: floatingPosition.top, left: floatingPosition.left, right: "auto", bottom: "auto" }
+        : { right: 16, bottom: 16 };
+    const floatingContainerStyle: React.CSSProperties = {
+        ...floatingContainerBaseStyle,
+        ...floatingPositionStyle,
     };
 
     const buttonRowStyle: React.CSSProperties = {
@@ -989,7 +1037,7 @@ type StoredAuth = {
         alignItems: "center",
         justifyContent: "center",
         gap: 8,
-        padding: "12px 22px",
+        padding: "12px 24px",
         borderRadius: 9999,
         border: "none",
         background: "#f4f5f7",
@@ -1001,6 +1049,7 @@ type StoredAuth = {
         boxShadow: "0 14px 24px rgba(15, 23, 42, 0.18)",
         transition:
             "transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease, color 0.2s ease",
+        minWidth: 150,
     };
 
     const recordButtonStyle: React.CSSProperties = {
@@ -1020,8 +1069,6 @@ type StoredAuth = {
 
     const logoutButtonStyle: React.CSSProperties = {
         ...buttonBaseStyle,
-        padding: "10px 18px",
-        fontSize: "13px",
         background: "#ffffff",
         border: "1px solid #e5e7eb",
         color: "#1f2933",
@@ -1055,6 +1102,23 @@ type StoredAuth = {
         fontSize: 13,
         background: "#111827",
         boxShadow: "none",
+        minWidth: 110,
+    };
+
+    const dragHandleStyle: React.CSSProperties = {
+        alignSelf: "center",
+        padding: "4px 14px",
+        borderRadius: 9999,
+        border: "1px dashed #d1d5db",
+        background: "rgba(255, 255, 255, 0.9)",
+        fontSize: 11,
+        fontWeight: 600,
+        letterSpacing: 0.8,
+        textTransform: "uppercase",
+        color: "#4b5563",
+        cursor: "grab",
+        userSelect: "none",
+        touchAction: "none",
     };
 
     const modalOverlayStyle: React.CSSProperties = {
@@ -1123,15 +1187,76 @@ type StoredAuth = {
         }
     }
 
+    function beginFloatingDrag(evt: React.PointerEvent<HTMLDivElement>) {
+        if (evt.button !== undefined && evt.button !== 0 && evt.pointerType === "mouse") {
+            return;
+        }
+        if (!floatingContainerRef.current) return;
+        const rect = floatingContainerRef.current.getBoundingClientRect();
+        dragStateRef.current = {
+            pointerId: evt.pointerId,
+            offsetX: evt.clientX - rect.left,
+            offsetY: evt.clientY - rect.top,
+            width: rect.width,
+            height: rect.height,
+        };
+        evt.preventDefault();
+    }
+
     return (
         <>
             {children}
             {(shareUrl || ready) && (
-                <div data-repro-internal="1" style={floatingContainerStyle}>
+                <div
+                    data-repro-internal="1"
+                    style={floatingContainerStyle}
+                    ref={floatingContainerRef}
+                >
+                    <div
+                        data-repro-internal="1"
+                        style={dragHandleStyle}
+                        onPointerDown={beginFloatingDrag}
+                        aria-label="Drag recording controls"
+                    >
+                        Drag
+                    </div>
                     {shareUrl && (
                         <div data-repro-internal="1" style={shareCardStyle}>
-                            <div style={{ fontSize: 12, fontWeight: 600, color: "#0f172a" }}>
-                                Latest capture ready to share
+                            <div
+                                style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    justifyContent: "space-between",
+                                    gap: 12,
+                                    width: "100%",
+                                }}
+                            >
+                                <div style={{ fontSize: 12, fontWeight: 600, color: "#0f172a" }}>
+                                    Latest capture ready to share
+                                </div>
+                                <button
+                                    type="button"
+                                    data-repro-internal="1"
+                                    onClick={() => clearShareInfo()}
+                                    style={{
+                                        border: "none",
+                                        background: "transparent",
+                                        color: "#9ca3af",
+                                        cursor: "pointer",
+                                        padding: 4,
+                                        lineHeight: 1,
+                                        fontWeight: 700,
+                                        borderRadius: 999,
+                                        width: 24,
+                                        height: 24,
+                                        display: "flex",
+                                        alignItems: "center",
+                                        justifyContent: "center",
+                                    }}
+                                    aria-label="Close share link"
+                                >
+                                    ×
+                                </button>
                             </div>
                             <div style={shareLinkStyle} title={shareUrl}>
                                 {shareUrl}
@@ -1143,20 +1268,29 @@ type StoredAuth = {
                                     alignItems: "center",
                                     justifyContent: "space-between",
                                     gap: 12,
+                                    width: "100%",
                                 }}
                             >
-                                {copyStatus !== "idle" && (
-                                    <span
-                                        style={{
-                                            fontSize: 12,
-                                            color: copyStatus === "copied" ? "#059669" : "#b91c1c",
-                                        }}
-                                    >
-                                        {copyStatus === "copied"
-                                            ? "Link copied!"
-                                            : "Unable to copy"}
-                                    </span>
-                                )}
+                                <span
+                                    style={{
+                                        fontSize: 12,
+                                        minWidth: 100,
+                                        color:
+                                            copyStatus === "copied"
+                                                ? "#059669"
+                                                : copyStatus === "error"
+                                                ? "#b91c1c"
+                                                : "#6b7280",
+                                        visibility: copyStatus === "idle" ? "hidden" : "visible",
+                                        transition: "color 0.2s ease",
+                                    }}
+                                >
+                                    {copyStatus === "copied"
+                                        ? "Link copied!"
+                                        : copyStatus === "error"
+                                        ? "Unable to copy"
+                                        : "placeholder"}
+                                </span>
                                 <button
                                     type="button"
                                     data-repro-internal="1"
