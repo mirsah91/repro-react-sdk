@@ -341,6 +341,11 @@ type StoredAuth = {
             lastAuthCheckTokenRef.current = null;
             return;
         }
+        if (!ready) return;
+
+        const sdkToken = sdkTokenRef.current;
+        if (!sdkToken) return;
+
         if (
             authCheckInFlightRef.current ||
             lastAuthCheckTokenRef.current === auth.token
@@ -359,6 +364,7 @@ type StoredAuth = {
                     headers: addTenantHeader({
                         Accept: "application/json",
                         Authorization: `Bearer ${auth.token}`,
+                        "x-sdk-token": sdkToken,
                         [INTERNAL_HEADER]: "1",
                     }),
                 });
@@ -377,7 +383,7 @@ type StoredAuth = {
         return () => {
             cancelled = true;
         };
-    }, [auth, appId, base]);
+    }, [auth, appId, base, ready]);
 
     useEffect(() => {
         userPasswordRef.current = auth?.password ?? null;
