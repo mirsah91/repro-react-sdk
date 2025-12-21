@@ -211,6 +211,7 @@ type StoredAuth = {
             return null;
         }
     })();
+    const initialAuthRef = useRef<StoredAuth>(initialAuth);
 
     // ---- refs & state (hooks MUST be inside component) ----
     const sdkTokenRef = useRef<string | null>(null);
@@ -337,7 +338,8 @@ type StoredAuth = {
     }, [base, tenantId]);
 
     useEffect(() => {
-        if (!auth?.token) {
+        const storedToken = initialAuthRef.current?.token ?? null;
+        if (!storedToken) {
             lastAuthCheckTokenRef.current = null;
             return;
         }
@@ -346,15 +348,19 @@ type StoredAuth = {
         const sdkToken = sdkTokenRef.current;
         if (!sdkToken) return;
 
+        if (auth?.token !== storedToken) {
+            return;
+        }
+
         if (
             authCheckInFlightRef.current ||
-            lastAuthCheckTokenRef.current === auth.token
+            lastAuthCheckTokenRef.current === storedToken
         ) {
             return;
         }
         let cancelled = false;
         authCheckInFlightRef.current = true;
-        lastAuthCheckTokenRef.current = auth.token;
+        lastAuthCheckTokenRef.current = storedToken;
 
         (async () => {
             try {
@@ -363,7 +369,7 @@ type StoredAuth = {
                     method: "GET",
                     headers: addTenantHeader({
                         Accept: "application/json",
-                        Authorization: `Bearer ${auth.token}`,
+                        Authorization: `Bearer ${storedToken}`,
                         "x-sdk-token": sdkToken,
                         [INTERNAL_HEADER]: "1",
                     }),
