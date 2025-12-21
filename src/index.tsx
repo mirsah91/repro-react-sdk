@@ -249,6 +249,8 @@ type StoredAuth = {
     const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
     const copyStatusTimerRef = useRef<number | null>(null);
     const logoutInFlightRef = useRef(false);
+    const authCheckInFlightRef = useRef(false);
+    const lastAuthCheckTokenRef = useRef<string | null>(null);
     const [controlsHidden, setControlsHidden] = useState(false);
     const [showHiddenNotice, setShowHiddenNotice] = useState(true);
     const shortcutKeysRef = useRef<Set<string>>(new Set());
@@ -333,6 +335,49 @@ type StoredAuth = {
             __reproCtx = null;
         };
     }, [base, tenantId]);
+
+    useEffect(() => {
+        if (!auth?.token) {
+            lastAuthCheckTokenRef.current = null;
+            return;
+        }
+        if (
+            authCheckInFlightRef.current ||
+            lastAuthCheckTokenRef.current === auth.token
+        ) {
+            return;
+        }
+        let cancelled = false;
+        authCheckInFlightRef.current = true;
+        lastAuthCheckTokenRef.current = auth.token;
+
+        (async () => {
+            try {
+                const fetcher = origFetchRef.current ?? window.fetch.bind(window);
+                const resp = await fetcher(`${base}/v1/apps/${appId}/users/me`, {
+                    method: "GET",
+                    headers: addTenantHeader({
+                        Accept: "application/json",
+                        Authorization: `Bearer ${auth.token}`,
+                        [INTERNAL_HEADER]: "1",
+                    }),
+                });
+                if (!cancelled && !resp.ok) {
+                    handleUnauthorized();
+                }
+            } catch {
+                if (!cancelled) {
+                    handleUnauthorized();
+                }
+            } finally {
+                authCheckInFlightRef.current = false;
+            }
+        })();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [auth, appId, base]);
 
     useEffect(() => {
         userPasswordRef.current = auth?.password ?? null;
