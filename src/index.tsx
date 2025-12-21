@@ -249,19 +249,9 @@ type StoredAuth = {
     const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
     const copyStatusTimerRef = useRef<number | null>(null);
     const logoutInFlightRef = useRef(false);
-    const floatingContainerRef = useRef<HTMLDivElement | null>(null);
     const [controlsHidden, setControlsHidden] = useState(false);
+    const [showHiddenNotice, setShowHiddenNotice] = useState(true);
     const shortcutKeysRef = useRef<Set<string>>(new Set());
-    const dragStateRef = useRef<{
-        pointerId: number;
-        offsetX: number;
-        offsetY: number;
-        width: number;
-        height: number;
-    } | null>(null);
-    const [floatingPosition, setFloatingPosition] = useState<{ top: number; left: number } | null>(
-        null
-    );
     const clearCopyStatusTimer = () => {
         if (copyStatusTimerRef.current == null) return;
         if (typeof window !== "undefined") {
@@ -459,38 +449,6 @@ type StoredAuth = {
     }, []);
 
     useEffect(() => {
-        const handlePointerMove = (evt: PointerEvent) => {
-            const dragState = dragStateRef.current;
-            if (!dragState || dragState.pointerId !== evt.pointerId) return;
-            evt.preventDefault();
-            const newLeft = evt.clientX - dragState.offsetX;
-            const newTop = evt.clientY - dragState.offsetY;
-            const maxLeft = Math.max(8, (window.innerWidth || 0) - dragState.width - 8);
-            const maxTop = Math.max(8, (window.innerHeight || 0) - dragState.height - 8);
-            const clampedLeft = Math.min(Math.max(8, newLeft), maxLeft);
-            const clampedTop = Math.min(Math.max(8, newTop), maxTop);
-            setFloatingPosition({ top: clampedTop, left: clampedLeft });
-        };
-        const endDrag = (evt: PointerEvent) => {
-            const dragState = dragStateRef.current;
-            if (!dragState) return;
-            if (evt.pointerId !== dragState.pointerId) return;
-            dragStateRef.current = null;
-        };
-        const cancelDrag = () => {
-            dragStateRef.current = null;
-        };
-        window.addEventListener("pointermove", handlePointerMove);
-        window.addEventListener("pointerup", endDrag);
-        window.addEventListener("pointercancel", cancelDrag);
-        return () => {
-            window.removeEventListener("pointermove", handlePointerMove);
-            window.removeEventListener("pointerup", endDrag);
-            window.removeEventListener("pointercancel", cancelDrag);
-        };
-    }, []);
-
-    useEffect(() => {
         const pressed = shortcutKeysRef.current;
         if (typeof window === "undefined") return;
         const handleKeyDown = (evt: KeyboardEvent) => {
@@ -508,6 +466,7 @@ type StoredAuth = {
                         evt.preventDefault();
                     }
                     setControlsHidden(false);
+                    setShowHiddenNotice(false);
                     pressed.clear();
                     return;
                 }
@@ -1094,12 +1053,10 @@ type StoredAuth = {
         width: "100%",
         maxWidth: 360,
     };
-    const floatingPositionStyle: React.CSSProperties = floatingPosition
-        ? { top: floatingPosition.top, left: floatingPosition.left, right: "auto", bottom: "auto" }
-        : { right: 16, bottom: 16 };
     const floatingContainerStyle: React.CSSProperties = {
         ...floatingContainerBaseStyle,
-        ...floatingPositionStyle,
+        right: 16,
+        bottom: 16,
     };
 
     const buttonRowStyle: React.CSSProperties = {
@@ -1193,22 +1150,6 @@ type StoredAuth = {
         fontSize: 12,
     };
 
-    const dragHandleStyle: React.CSSProperties = {
-        alignSelf: "center",
-        padding: "4px 14px",
-        borderRadius: 9999,
-        border: "1px dashed #d1d5db",
-        background: "rgba(255, 255, 255, 0.9)",
-        fontSize: 11,
-        fontWeight: 600,
-        letterSpacing: 0.8,
-        textTransform: "uppercase",
-        color: "#4b5563",
-        cursor: "grab",
-        userSelect: "none",
-        touchAction: "none",
-    };
-
     const modalOverlayStyle: React.CSSProperties = {
         position: "fixed",
         inset: 0,
@@ -1245,6 +1186,16 @@ type StoredAuth = {
         fontSize: 13,
         lineHeight: 1.4,
     };
+    const hiddenNoticeCloseStyle: React.CSSProperties = {
+        border: "none",
+        background: "transparent",
+        color: "#e5e7eb",
+        cursor: "pointer",
+        fontWeight: 700,
+        padding: 0,
+        lineHeight: 1,
+        fontSize: 14,
+    };
 
     const labelStyle: React.CSSProperties = {
         display: "block",
@@ -1267,6 +1218,7 @@ type StoredAuth = {
 
     const hideControls = () => {
         setControlsHidden(true);
+        setShowHiddenNotice(true);
     };
 
     async function copyShareLink() {
@@ -1295,40 +1247,16 @@ type StoredAuth = {
         }
     }
 
-    function beginFloatingDrag(evt: React.PointerEvent<HTMLDivElement>) {
-        if (evt.button !== undefined && evt.button !== 0 && evt.pointerType === "mouse") {
-            return;
-        }
-        if (!floatingContainerRef.current) return;
-        const rect = floatingContainerRef.current.getBoundingClientRect();
-        dragStateRef.current = {
-            pointerId: evt.pointerId,
-            offsetX: evt.clientX - rect.left,
-            offsetY: evt.clientY - rect.top,
-            width: rect.width,
-            height: rect.height,
-        };
-        evt.preventDefault();
-    }
-
     return (
         <>
             {children}
             {!controlsHidden && (shareUrl || ready) && (
-                <div data-repro-internal="1" style={floatingContainerStyle} ref={floatingContainerRef}>
+                <div data-repro-internal="1" style={floatingContainerStyle}>
                     <div
                         data-repro-internal="1"
-                        style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", gap: 8 }}
+                        style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", width: "100%", gap: 8 }}
                         aria-label="Recording controls header"
                     >
-                        <div
-                            data-repro-internal="1"
-                            style={dragHandleStyle}
-                            onPointerDown={beginFloatingDrag}
-                            aria-label="Drag recording controls"
-                        >
-                            Drag
-                        </div>
                         <button
                             type="button"
                             data-repro-internal="1"
@@ -1470,9 +1398,20 @@ type StoredAuth = {
                     )}
                 </div>
             )}
-            {controlsHidden && (
+            {controlsHidden && showHiddenNotice && (
                 <div data-repro-internal="1" style={hiddenNoticeStyle}>
-                    <div style={{ fontWeight: 700, marginBottom: 4 }}>Recording controls hidden</div>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                        <div style={{ fontWeight: 700 }}>Recording controls hidden</div>
+                        <button
+                            type="button"
+                            data-repro-internal="1"
+                            style={hiddenNoticeCloseStyle}
+                            aria-label="Close hidden controls message"
+                            onClick={() => setShowHiddenNotice(false)}
+                        >
+                            ×
+                        </button>
+                    </div>
                     <div>Press Ctrl/Cmd + R + O to show them again.</div>
                 </div>
             )}
