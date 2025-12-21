@@ -11,16 +11,24 @@ import { gzip } from 'pako';
  * - Uses ORIGINAL fetch for SDK-internal calls to avoid recursion
  */
 
+type RrwebRecordOptions = NonNullable<Parameters<typeof record>[0]>;
+export type MaskingOptions = Pick<
+    RrwebRecordOptions,
+    "maskAllInputs" | "maskTextClass" | "maskTextSelector" | "maskInputOptions" | "maskInputFn" | "maskTextFn"
+>;
+
 type Props = {
     appId: string;
     tenantId: string;
     apiBase?: string; // default: http://localhost:4000
     children: React.ReactNode;
     button?: { text?: string }; // optional override label
+    masking?: MaskingOptions;
 };
 
 // config
 const MAX_BYTES = 900 * 1024; // 900 KB target per POST (tune)
+const SESSION_MAX_MS = 60 * 1000; // cap each session at 1 minute
 
 // estimate JSON bytes
 function jsonBytes(obj: any): number {
@@ -169,7 +177,7 @@ export function attachAxios(axiosInstance: any) {
 
 type ActionMeta = { tStart: number; label?: string };
 
-export function ReproProvider({ appId, tenantId, apiBase, children, button }: Props) {
+export function ReproProvider({ appId, tenantId, apiBase, children, button, masking }: Props) {
     const base = apiBase || "http://localhost:4000";
 type StoredAuth = {
     email: string;
@@ -211,6 +219,7 @@ type StoredAuth = {
     const rrwebEventsRef = useRef<any[]>([]);
     const currentAidRef = useRef<string | null>(null);
     const aidExpiryTimerRef = useRef<number | null>(null);
+    const sessionExpiryTimerRef = useRef<number | null>(null);
     const origFetchRef = useRef<typeof window.fetch>();
     const hasReqMarkedRef = useRef<Set<string>>(new Set());
     const lastActionLabelRef = useRef<string | null>(null);
@@ -241,6 +250,8 @@ type StoredAuth = {
     const copyStatusTimerRef = useRef<number | null>(null);
     const logoutInFlightRef = useRef(false);
     const floatingContainerRef = useRef<HTMLDivElement | null>(null);
+    const [controlsHidden, setControlsHidden] = useState(false);
+    const shortcutKeysRef = useRef<Set<string>>(new Set());
     const dragStateRef = useRef<{
         pointerId: number;
         offsetX: number;
@@ -278,6 +289,16 @@ type StoredAuth = {
                 copyStatusTimerRef.current = null;
             }, 2200);
         }
+    };
+
+    const clearSessionExpiryTimer = () => {
+        if (sessionExpiryTimerRef.current == null) return;
+        if (typeof window !== "undefined") {
+            window.clearTimeout(sessionExpiryTimerRef.current);
+        } else {
+            clearTimeout(sessionExpiryTimerRef.current);
+        }
+        sessionExpiryTimerRef.current = null;
     };
 
     const addTenantHeader = (headers: Record<string, string>) => {
@@ -433,6 +454,7 @@ type StoredAuth = {
     useEffect(() => {
         return () => {
             clearCopyStatusTimer();
+            clearSessionExpiryTimer();
         };
     }, []);
 
@@ -467,6 +489,54 @@ type StoredAuth = {
             window.removeEventListener("pointercancel", cancelDrag);
         };
     }, []);
+
+    useEffect(() => {
+        const pressed = shortcutKeysRef.current;
+        if (typeof window === "undefined") return;
+        const handleKeyDown = (evt: KeyboardEvent) => {
+            const hasMod = evt.ctrlKey || evt.metaKey;
+            if (!hasMod) {
+                pressed.clear();
+                return;
+            }
+            const key = (evt.key || "").toLowerCase();
+            if (key === "r" || key === "o") {
+                pressed.add(key);
+                const combo = pressed.has("r") && pressed.has("o");
+                if (combo) {
+                    if (controlsHidden) {
+                        evt.preventDefault();
+                    }
+                    setControlsHidden(false);
+                    pressed.clear();
+                    return;
+                }
+                if (controlsHidden) {
+                    evt.preventDefault();
+                }
+                return;
+            }
+            if (key === "control" || key === "meta") {
+                pressed.clear();
+                return;
+            }
+            pressed.clear();
+        };
+        const handleKeyUp = (evt: KeyboardEvent) => {
+            const key = (evt.key || "").toLowerCase();
+            if (key === "r" || key === "o") {
+                pressed.delete(key);
+            } else if (key === "control" || key === "meta") {
+                pressed.clear();
+            }
+        };
+        window.addEventListener("keydown", handleKeyDown, true);
+        window.addEventListener("keyup", handleKeyUp, true);
+        return () => {
+            window.removeEventListener("keydown", handleKeyDown, true);
+            window.removeEventListener("keyup", handleKeyUp, true);
+        };
+    }, [controlsHidden]);
 
     // ---- bootstrap once ----
     useEffect(() => {
@@ -880,6 +950,7 @@ type StoredAuth = {
                     flushRrwebBuffer('size');
                 }
             },
+            ...(masking ?? {}),
         });
 
         // 5) cleanup registration
@@ -890,11 +961,17 @@ type StoredAuth = {
             }
         };
 
+        clearSessionExpiryTimer();
+        sessionExpiryTimerRef.current = window.setTimeout(() => {
+            void stop();
+        }, SESSION_MAX_MS);
+
         setRecording(true);
     }
 
     // ---- STOP recording ----
     async function stop() {
+        clearSessionExpiryTimer();
         if (!recording || isStoppingRef.current) return;
         isStoppingRef.current = true;
 
@@ -1105,6 +1182,17 @@ type StoredAuth = {
         minWidth: 110,
     };
 
+    const hideButtonStyle: React.CSSProperties = {
+        border: "none",
+        background: "transparent",
+        color: "#6b7280",
+        cursor: "pointer",
+        fontWeight: 700,
+        padding: "6px 8px",
+        borderRadius: 8,
+        fontSize: 12,
+    };
+
     const dragHandleStyle: React.CSSProperties = {
         alignSelf: "center",
         padding: "4px 14px",
@@ -1142,6 +1230,22 @@ type StoredAuth = {
         fontFamily: "ui-sans-serif, system-ui, -apple-system",
     };
 
+    const hiddenNoticeStyle: React.CSSProperties = {
+        position: "fixed",
+        right: 16,
+        bottom: 16,
+        zIndex: 2147483647,
+        maxWidth: 320,
+        background: "#111827",
+        color: "#e5e7eb",
+        borderRadius: 12,
+        padding: "12px 14px",
+        boxShadow: "0 16px 30px rgba(0, 0, 0, 0.3)",
+        fontFamily: "ui-sans-serif, system-ui, -apple-system",
+        fontSize: 13,
+        lineHeight: 1.4,
+    };
+
     const labelStyle: React.CSSProperties = {
         display: "block",
         fontSize: 13,
@@ -1159,6 +1263,10 @@ type StoredAuth = {
         marginBottom: 14,
         boxSizing: "border-box",
         fontFamily: "inherit",
+    };
+
+    const hideControls = () => {
+        setControlsHidden(true);
     };
 
     async function copyShareLink() {
@@ -1206,19 +1314,30 @@ type StoredAuth = {
     return (
         <>
             {children}
-            {(shareUrl || ready) && (
-                <div
-                    data-repro-internal="1"
-                    style={floatingContainerStyle}
-                    ref={floatingContainerRef}
-                >
+            {!controlsHidden && (shareUrl || ready) && (
+                <div data-repro-internal="1" style={floatingContainerStyle} ref={floatingContainerRef}>
                     <div
                         data-repro-internal="1"
-                        style={dragHandleStyle}
-                        onPointerDown={beginFloatingDrag}
-                        aria-label="Drag recording controls"
+                        style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", gap: 8 }}
+                        aria-label="Recording controls header"
                     >
-                        Drag
+                        <div
+                            data-repro-internal="1"
+                            style={dragHandleStyle}
+                            onPointerDown={beginFloatingDrag}
+                            aria-label="Drag recording controls"
+                        >
+                            Drag
+                        </div>
+                        <button
+                            type="button"
+                            data-repro-internal="1"
+                            onClick={hideControls}
+                            style={hideButtonStyle}
+                            aria-label="Hide recording controls"
+                        >
+                            Hide
+                        </button>
                     </div>
                     {shareUrl && (
                         <div data-repro-internal="1" style={shareCardStyle}>
@@ -1349,6 +1468,12 @@ type StoredAuth = {
                             </button>
                         </div>
                     )}
+                </div>
+            )}
+            {controlsHidden && (
+                <div data-repro-internal="1" style={hiddenNoticeStyle}>
+                    <div style={{ fontWeight: 700, marginBottom: 4 }}>Recording controls hidden</div>
+                    <div>Press Ctrl/Cmd + R + O to show them again.</div>
                 </div>
             )}
             {showLogin && (
