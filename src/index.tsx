@@ -375,12 +375,12 @@ type StoredAuth = {
                         [INTERNAL_HEADER]: "1",
                     }),
                 });
-                if (!cancelled && !resp.ok) {
-                    handleUnauthorized();
-                }
+                if (cancelled) return;
+                if (resp.ok) return;
+                handleUnauthorizedStatus(resp.status);
             } catch {
                 if (!cancelled) {
-                    handleUnauthorized();
+                    // Avoid logging out on transient validation failures.
                 }
             } finally {
                 authCheckInFlightRef.current = false;
