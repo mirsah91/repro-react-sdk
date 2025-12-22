@@ -11,16 +11,24 @@ import { gzip } from 'pako';
  * - Uses ORIGINAL fetch for SDK-internal calls to avoid recursion
  */
 
+type RrwebRecordOptions = NonNullable<Parameters<typeof record>[0]>;
+export type MaskingOptions = Pick<
+    RrwebRecordOptions,
+    "maskAllInputs" | "maskTextClass" | "maskTextSelector" | "maskInputOptions" | "maskInputFn" | "maskTextFn"
+>;
+
 type Props = {
     appId: string;
     tenantId: string;
     apiBase?: string; // default: http://localhost:4000
     children: React.ReactNode;
     button?: { text?: string }; // optional override label
+    masking?: MaskingOptions;
 };
 
 // config
 const MAX_BYTES = 900 * 1024; // 900 KB target per POST (tune)
+const SESSION_MAX_MS = 60 * 1000; // cap each session at 1 minute
 
 // estimate JSON bytes
 function jsonBytes(obj: any): number {
@@ -77,6 +85,7 @@ type ReproCtx = {
     getTenantId: () => string | null;
     getFetch: () => typeof window.fetch;
     hasReqMarked: Set<string>;
+    onUnauthorized?: () => void;
 };
 let __reproCtx: ReproCtx | null = null;
 
@@ -141,6 +150,9 @@ export function attachAxios(axiosInstance: any) {
             const url = `${resp.config.baseURL || ""}${resp.config.url || ""}`;
             const isInternal = url.startsWith(ctx.base);
             const isSdkInternal = !!resp.config.headers?.[INTERNAL_HEADER];
+            if (isInternal && resp.status === 401) {
+                ctx.onUnauthorized?.();
+            }
 
             const sid = ctx.getSid();
             const aid = ctx.getAid();
@@ -149,13 +161,23 @@ export function attachAxios(axiosInstance: any) {
             }
             return resp;
         },
-        (err: any) => Promise.reject(err)
+        (err: any) => {
+            const ctx = __reproCtx;
+            if (ctx) {
+                const status = err?.response?.status;
+                const url = `${err?.config?.baseURL || ""}${err?.config?.url || ""}`;
+                if (status === 401 && url.startsWith(ctx.base)) {
+                    ctx.onUnauthorized?.();
+                }
+            }
+            return Promise.reject(err);
+        }
     );
 }
 
 type ActionMeta = { tStart: number; label?: string };
 
-export function ReproProvider({ appId, tenantId, apiBase, children, button }: Props) {
+export function ReproProvider({ appId, tenantId, apiBase, children, button, masking }: Props) {
     const base = apiBase || "http://localhost:4000";
 type StoredAuth = {
     email: string;
@@ -189,6 +211,7 @@ type StoredAuth = {
             return null;
         }
     })();
+    const initialAuthRef = useRef<StoredAuth>(initialAuth);
 
     // ---- refs & state (hooks MUST be inside component) ----
     const sdkTokenRef = useRef<string | null>(null);
@@ -197,6 +220,7 @@ type StoredAuth = {
     const rrwebEventsRef = useRef<any[]>([]);
     const currentAidRef = useRef<string | null>(null);
     const aidExpiryTimerRef = useRef<number | null>(null);
+    const sessionExpiryTimerRef = useRef<number | null>(null);
     const origFetchRef = useRef<typeof window.fetch>();
     const hasReqMarkedRef = useRef<Set<string>>(new Set());
     const lastActionLabelRef = useRef<string | null>(null);
@@ -204,6 +228,7 @@ type StoredAuth = {
     const nextSeqRef = useRef<number>(1); // rrweb chunk counter
     const isFlushingRef = useRef(false);
     const backoffRef = useRef(0); // ms
+    const isStoppingRef = useRef(false);
 
     // NEW: track installed click handler + dedupe recent clicks
     const clickHandlerRef = useRef<((e: MouseEvent) => void) | null>(null);
@@ -211,6 +236,7 @@ type StoredAuth = {
 
     const [ready, setReady] = useState(false);
     const [recording, setRecording] = useState(false);
+    const recordingRef = useRef(false);
     const [auth, setAuth] = useState<StoredAuth>(initialAuth);
     const userPasswordRef = useRef<string | null>(initialAuth?.password ?? null);
     const userTokenRef = useRef<string | null>(initialAuth?.token ?? null);
@@ -221,6 +247,53 @@ type StoredAuth = {
     const [loginError, setLoginError] = useState<string | null>(null);
     const [isLoggingIn, setIsLoggingIn] = useState(false);
     const disableLogin = isLoggingIn || !loginEmail.trim() || !loginPassword.trim();
+    const [shareUrl, setShareUrl] = useState<string | null>(null);
+    const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "error">("idle");
+    const copyStatusTimerRef = useRef<number | null>(null);
+    const logoutInFlightRef = useRef(false);
+    const authCheckInFlightRef = useRef(false);
+    const lastAuthCheckTokenRef = useRef<string | null>(null);
+    const [controlsHidden, setControlsHidden] = useState(false);
+    const [showHiddenNotice, setShowHiddenNotice] = useState(true);
+    const shortcutKeysRef = useRef<Set<string>>(new Set());
+    const clearCopyStatusTimer = () => {
+        if (copyStatusTimerRef.current == null) return;
+        if (typeof window !== "undefined") {
+            window.clearTimeout(copyStatusTimerRef.current);
+        } else {
+            clearTimeout(copyStatusTimerRef.current);
+        }
+        copyStatusTimerRef.current = null;
+    };
+    const resetCopyFeedback = () => {
+        clearCopyStatusTimer();
+        setCopyStatus("idle");
+    };
+    const clearShareInfo = () => {
+        setShareUrl(null);
+        resetCopyFeedback();
+    };
+    const setCopyStatusWithTimeout = (status: "idle" | "copied" | "error") => {
+        clearCopyStatusTimer();
+        setCopyStatus(status);
+        if (status === "idle") return;
+        if (typeof window !== "undefined") {
+            copyStatusTimerRef.current = window.setTimeout(() => {
+                setCopyStatus("idle");
+                copyStatusTimerRef.current = null;
+            }, 2200);
+        }
+    };
+
+    const clearSessionExpiryTimer = () => {
+        if (sessionExpiryTimerRef.current == null) return;
+        if (typeof window !== "undefined") {
+            window.clearTimeout(sessionExpiryTimerRef.current);
+        } else {
+            clearTimeout(sessionExpiryTimerRef.current);
+        }
+        sessionExpiryTimerRef.current = null;
+    };
 
     const addTenantHeader = (headers: Record<string, string>) => {
         const tenant = tenantIdRef.current;
@@ -258,11 +331,66 @@ type StoredAuth = {
             getTenantId: () => tenantIdRef.current,
             getFetch: () => (origFetchRef.current ?? window.fetch.bind(window)),
             hasReqMarked: hasReqMarkedRef.current,
+            onUnauthorized: () => handleUnauthorized(),
         };
         return () => {
             __reproCtx = null;
         };
     }, [base, tenantId]);
+
+    useEffect(() => {
+        const storedToken = initialAuthRef.current?.token ?? null;
+        if (!storedToken) {
+            lastAuthCheckTokenRef.current = null;
+            return;
+        }
+        if (!ready) return;
+
+        const sdkToken = sdkTokenRef.current;
+        if (!sdkToken) return;
+
+        if (auth?.token !== storedToken) {
+            return;
+        }
+
+        if (
+            authCheckInFlightRef.current ||
+            lastAuthCheckTokenRef.current === storedToken
+        ) {
+            return;
+        }
+        let cancelled = false;
+        authCheckInFlightRef.current = true;
+        lastAuthCheckTokenRef.current = storedToken;
+
+        (async () => {
+            try {
+                const fetcher = origFetchRef.current ?? window.fetch.bind(window);
+                const resp = await fetcher(`${base}/v1/apps/${appId}/users/me`, {
+                    method: "GET",
+                    headers: addTenantHeader({
+                        Accept: "application/json",
+                        Authorization: `Bearer ${storedToken}`,
+                        "x-sdk-token": sdkToken,
+                        [INTERNAL_HEADER]: "1",
+                    }),
+                });
+                if (cancelled) return;
+                if (resp.ok) return;
+                handleUnauthorizedStatus(resp.status);
+            } catch {
+                if (!cancelled) {
+                    // Avoid logging out on transient validation failures.
+                }
+            } finally {
+                authCheckInFlightRef.current = false;
+            }
+        })();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [auth, appId, base, ready]);
 
     useEffect(() => {
         userPasswordRef.current = auth?.password ?? null;
@@ -333,20 +461,99 @@ type StoredAuth = {
         login(loginEmail.trim(), loginPassword.trim());
     }
 
-    function logout() {
-        if (recording) {
-            void stop();
+    async function logout(options?: { showLogin?: boolean }) {
+        if (logoutInFlightRef.current) return;
+        logoutInFlightRef.current = true;
+        try {
+            if (recording && !isStoppingRef.current) {
+                try {
+                    await stop();
+                } catch {
+                    /* ignore */
+                }
+            }
+            setAuth(null);
+            setLoginPassword("");
+            clearShareInfo();
+            setShowLogin(options?.showLogin ?? false);
+        } finally {
+            logoutInFlightRef.current = false;
         }
-        setAuth(null);
-        setLoginPassword("");
-        setShowLogin(false);
     }
+
+    function handleUnauthorized() {
+        void logout({ showLogin: true });
+    }
+
+    const handleUnauthorizedStatus = (status?: number | null) => {
+        if (status === 401) {
+            handleUnauthorized();
+            return true;
+        }
+        return false;
+    };
 
     useEffect(() => {
         if (!showLogin) {
             setLoginError(null);
         }
     }, [showLogin]);
+
+    useEffect(() => {
+        return () => {
+            clearCopyStatusTimer();
+            clearSessionExpiryTimer();
+        };
+    }, []);
+
+    useEffect(() => {
+        const pressed = shortcutKeysRef.current;
+        if (typeof window === "undefined") return;
+        const handleKeyDown = (evt: KeyboardEvent) => {
+            const hasMod = evt.ctrlKey || evt.metaKey;
+            if (!hasMod) {
+                pressed.clear();
+                return;
+            }
+            const key = (evt.key || "").toLowerCase();
+            if (key === "r" || key === "o") {
+                pressed.add(key);
+                const combo = pressed.has("r") && pressed.has("o");
+                if (combo) {
+                    if (controlsHidden) {
+                        evt.preventDefault();
+                    }
+                    setControlsHidden(false);
+                    setShowHiddenNotice(false);
+                    pressed.clear();
+                    return;
+                }
+                if (controlsHidden) {
+                    evt.preventDefault();
+                }
+                return;
+            }
+            if (key === "control" || key === "meta") {
+                pressed.clear();
+                return;
+            }
+            pressed.clear();
+        };
+        const handleKeyUp = (evt: KeyboardEvent) => {
+            const key = (evt.key || "").toLowerCase();
+            if (key === "r" || key === "o") {
+                pressed.delete(key);
+            } else if (key === "control" || key === "meta") {
+                pressed.clear();
+            }
+        };
+        window.addEventListener("keydown", handleKeyDown, true);
+        window.addEventListener("keyup", handleKeyUp, true);
+        return () => {
+            window.removeEventListener("keydown", handleKeyDown, true);
+            window.removeEventListener("keyup", handleKeyUp, true);
+        };
+    }, [controlsHidden]);
 
     // ---- bootstrap once ----
     useEffect(() => {
@@ -395,6 +602,7 @@ type StoredAuth = {
                 }),
                 body: gz,
             });
+            if (handleUnauthorizedStatus(r.status)) return 'fail';
             if (r.status === 413) return 'too_large';
             if (!r.ok) return 'fail';
             return 'ok';
@@ -489,6 +697,7 @@ type StoredAuth = {
                 }),
                 body: JSON.stringify({ ...envelope, seq }), // ensure seq matches piece
             });
+            if (handleUnauthorizedStatus(r.status)) return 'fail';
             if (r.status === 413) return 'too_large';
             if (!r.ok) return 'fail';
             return 'ok';
@@ -536,6 +745,9 @@ type StoredAuth = {
                 const hdrs = resp.config.headers || {};
                 const isInternal = url.startsWith(base);
                 const isSdkInternal = hdrs[INTERNAL_HEADER] != null;
+                if (isInternal) {
+                    handleUnauthorizedStatus(resp.status);
+                }
 
                 if (
                     !isInternal &&
@@ -595,10 +807,11 @@ type StoredAuth = {
 
     // ---- START recording ----
     async function start() {
-        if (!sdkTokenRef.current || recording) return;
+        if (!sdkTokenRef.current || recordingRef.current) return;
 
         // 1) start session
         if (!requireAuth()) return;
+        clearShareInfo();
 
         const r = await fetch(`${base}/v1/sessions`, {
             method: "POST",
@@ -610,11 +823,7 @@ type StoredAuth = {
             body: JSON.stringify({ clientTime: nowServer() }),
         });
         if (!r.ok) {
-            if (r.status === 401) {
-                setAuth(null);
-                setLoginPassword("");
-                setShowLogin(true);
-            }
+            handleUnauthorizedStatus(r.status);
             return;
         }
         const sess = (await r.json()) as { sessionId: string; clockOffsetMs: number };
@@ -661,6 +870,9 @@ type StoredAuth = {
 
             // always call ORIGINAL fetch to avoid recursion
             const res = await origFetchRef.current!(input as any, init);
+            if (isInternal) {
+                handleUnauthorizedStatus(res.status);
+            }
 
             // mark hasReq ONCE per action (skip internal/API calls)
             if (
@@ -736,7 +948,11 @@ type StoredAuth = {
                         ],
                     }),
                 }
-            ).catch(() => {});
+            )
+                .then((resp) => {
+                    handleUnauthorizedStatus(resp.status);
+                })
+                .catch(() => {});
         };
 
         clickHandlerRef.current = clickHandler;
@@ -751,6 +967,7 @@ type StoredAuth = {
                     flushRrwebBuffer('size');
                 }
             },
+            ...(masking ?? {}),
         });
 
         // 5) cleanup registration
@@ -761,41 +978,80 @@ type StoredAuth = {
             }
         };
 
+        clearSessionExpiryTimer();
+        sessionExpiryTimerRef.current = window.setTimeout(() => {
+            void stop();
+        }, SESSION_MAX_MS);
+
+        recordingRef.current = true;
         setRecording(true);
     }
 
     // ---- STOP recording ----
     async function stop() {
-        if (!recording) return;
+        clearSessionExpiryTimer();
+        if (!recordingRef.current || isStoppingRef.current) return;
+        isStoppingRef.current = true;
 
-        // stop rrweb + listeners
-        stopRecRef.current?.();
-        (stop as any)._cleanup?.();
-
-        // clear periodic timer
-        if (rrFlushTimerRef.current) {
-            window.clearInterval(rrFlushTimerRef.current);
-            rrFlushTimerRef.current = null;
-        }
-
-        // final flush of whatever is left
-        await flushRrwebBuffer('stop');
-
-        const origFetch = origFetchRef.current ?? window.fetch.bind(window);
-        const sid = sessionIdRef.current!;
-        const token = sdkTokenRef.current!;
-
-        // 1) upload rrweb chunks (internal; use original fetch)
         try {
-            const events = rrwebEventsRef.current;
-            const CHUNK = 500;
-            for (let i = 0; i < events.length; i += CHUNK) {
-                const slice = events.slice(i, i + CHUNK);
-                const seq = nextSeqRef.current++;
-                const tFirst = slice[0]?.timestamp ?? nowServer();
-                const tLast  = slice[slice.length - 1]?.timestamp ?? tFirst;
+            // stop rrweb + listeners
+            stopRecRef.current?.();
+            (stop as any)._cleanup?.();
 
-                await origFetch(`${base}/v1/sessions/${sid}/events`, {
+            // clear periodic timer
+            if (rrFlushTimerRef.current) {
+                window.clearInterval(rrFlushTimerRef.current);
+                rrFlushTimerRef.current = null;
+            }
+
+            // final flush of whatever is left
+            await flushRrwebBuffer('stop');
+
+            const origFetch = origFetchRef.current ?? window.fetch.bind(window);
+            const sid = sessionIdRef.current!;
+            const token = sdkTokenRef.current!;
+
+            // 1) upload rrweb chunks (internal; use original fetch)
+            try {
+                const events = rrwebEventsRef.current;
+                const CHUNK = 500;
+                for (let i = 0; i < events.length; i += CHUNK) {
+                    const slice = events.slice(i, i + CHUNK);
+                    const seq = nextSeqRef.current++;
+                    const tFirst = slice[0]?.timestamp ?? nowServer();
+                    const tLast  = slice[slice.length - 1]?.timestamp ?? tFirst;
+
+                    const chunkRes = await origFetch(`${base}/v1/sessions/${sid}/events`, {
+                        method: "POST",
+                        headers: addTenantHeader({
+                            "Content-Type": "application/json",
+                            "x-sdk-token": token,
+                            ...(userTokenRef.current ? { Authorization: `Bearer ${userTokenRef.current}` } : {}),
+                            [INTERNAL_HEADER]: "1",
+                        }),
+                        body: JSON.stringify({
+                            type: "rrweb",
+                            seq,
+                            tFirst,
+                            tLast,
+                            events: slice, // send raw array
+                        }),
+                    });
+                    if (handleUnauthorizedStatus(chunkRes.status)) {
+                        break;
+                    }
+                }
+            } catch {
+                /* ignore in MVP */
+            } finally {
+                rrwebEventsRef.current = [];
+                nextSeqRef.current = 1;
+                actionMeta.current.clear();
+            }
+
+            // 2) finish (internal; use original fetch)
+            try {
+                const res = await origFetch(`${base}/v1/sessions/${sid}/finish`, {
                     method: "POST",
                     headers: addTenantHeader({
                         "Content-Type": "application/json",
@@ -803,99 +1059,155 @@ type StoredAuth = {
                         ...(userTokenRef.current ? { Authorization: `Bearer ${userTokenRef.current}` } : {}),
                         [INTERNAL_HEADER]: "1",
                     }),
-                    body: JSON.stringify({
-                        type: "rrweb",
-                        seq,
-                        tFirst,
-                        tLast,
-                        events: slice, // send raw array
-                    }),
+                    body: JSON.stringify({ notes: "" }),
                 });
+                if (handleUnauthorizedStatus(res.status)) {
+                    clearShareInfo();
+                } else if (res.ok) {
+                    let fin: any = null;
+                    try {
+                        fin = await res.json();
+                    } catch {
+                        fin = null;
+                    }
+                    if (fin?.viewerUrl) {
+                        resetCopyFeedback();
+                        setShareUrl(fin.viewerUrl);
+                    } else {
+                        clearShareInfo();
+                    }
+                } else {
+                    clearShareInfo();
+                }
+            } catch {
+                clearShareInfo();
             }
-        } catch {
-            /* ignore in MVP */
         } finally {
-            rrwebEventsRef.current = [];
-            nextSeqRef.current = 1;
-            actionMeta.current.clear();
+            // 3) restore fetch & reset
+            if (origFetchRef.current) window.fetch = origFetchRef.current;
+            sessionIdRef.current = null;
+            currentAidRef.current = null;
+            lastActionLabelRef.current = null;
+            hasReqMarkedRef.current.clear();
+            if (aidExpiryTimerRef.current) window.clearTimeout(aidExpiryTimerRef.current);
+            // also reset dedupe
+            lastClickRef.current = null;
+
+            setRecording(false);
+            recordingRef.current = false;
+            isStoppingRef.current = false;
         }
-
-        // 2) finish (internal; use original fetch)
-        try {
-            const res = await origFetch(`${base}/v1/sessions/${sid}/finish`, {
-                method: "POST",
-                headers: addTenantHeader({
-                    "Content-Type": "application/json",
-                    "x-sdk-token": token,
-                    ...(userTokenRef.current ? { Authorization: `Bearer ${userTokenRef.current}` } : {}),
-                    [INTERNAL_HEADER]: "1",
-                }),
-                body: JSON.stringify({ notes: "" }),
-            });
-            const fin = await res.json();
-            if (fin?.viewerUrl) window.open(fin.viewerUrl, "_blank");
-        } catch {
-            /* ignore in MVP */
-        }
-
-        // 3) restore fetch & reset
-        if (origFetchRef.current) window.fetch = origFetchRef.current;
-        sessionIdRef.current = null;
-        currentAidRef.current = null;
-        lastActionLabelRef.current = null;
-        hasReqMarkedRef.current.clear();
-        if (aidExpiryTimerRef.current) window.clearTimeout(aidExpiryTimerRef.current);
-        // also reset dedupe
-        lastClickRef.current = null;
-
-        setRecording(false);
     }
 
     // ---- UI (floating button) ----
     const btnLabel = recording ? (button?.text ?? "Stop & Report") : (button?.text ?? "Record");
     const loginLabel = "Authenticate to Record";
 
-    const buttonBaseStyle: React.CSSProperties = {
+    const floatingContainerBaseStyle: React.CSSProperties = {
         position: "fixed",
+        zIndex: 2147483647,
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "flex-end",
+        gap: 12,
+        width: "100%",
+        maxWidth: 360,
+    };
+    const floatingContainerStyle: React.CSSProperties = {
+        ...floatingContainerBaseStyle,
         right: 16,
         bottom: 16,
-        zIndex: 2147483647,
-        padding: "12px 22px",
-        borderRadius: 4,
-        border: "1px solid #d1d5db",
+    };
+
+    const buttonRowStyle: React.CSSProperties = {
+        display: "flex",
+        gap: 10,
+        justifyContent: "flex-end",
+        width: "100%",
+    };
+
+    const buttonBaseStyle: React.CSSProperties = {
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 8,
+        padding: "12px 24px",
+        borderRadius: 9999,
+        border: "none",
         background: "#f4f5f7",
         cursor: "pointer",
         fontFamily: "ui-sans-serif, system-ui, -apple-system",
         fontSize: "14px",
         fontWeight: 600,
-        color: "#1f2933",
-        boxShadow: "0 14px 24px rgba(15, 23, 42, 0.16)",
-        transition: "transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease",
+        color: "#ffffff",
+        boxShadow: "0 14px 24px rgba(15, 23, 42, 0.18)",
+        transition:
+            "transform 0.2s ease, box-shadow 0.2s ease, background 0.2s ease, color 0.2s ease",
+        minWidth: 150,
     };
 
     const recordButtonStyle: React.CSSProperties = {
         ...buttonBaseStyle,
-        bottom: auth ? 72 : 16,
-        background: recording ? "#fbeaea" : "#f3f4f6",
-        borderColor: recording ? "#f5b8b8" : "#d1d5db",
-        color: recording ? "#9b1c1c" : "#1f2933",
+        background: recording
+            ? "linear-gradient(120deg, #ef4444, #b91c1c)"
+            : "linear-gradient(120deg, #2563eb, #1d4ed8)",
+        boxShadow: recording
+            ? "0 18px 32px rgba(239, 68, 68, 0.35)"
+            : "0 18px 32px rgba(37, 99, 235, 0.35)",
     };
 
     const loginButtonStyle: React.CSSProperties = {
         ...buttonBaseStyle,
-        background: "#ffffff",
-        borderColor: "#d1d5db",
-        color: "#1f2933",
+        background: "linear-gradient(120deg, #14b8a6, #0d9488)",
     };
 
     const logoutButtonStyle: React.CSSProperties = {
         ...buttonBaseStyle,
-        padding: "8px 16px",
-        fontSize: "12px",
-        fontWeight: 600,
         background: "#ffffff",
-        borderColor: "#d1d5db",
-        color: "#4b5563",
+        border: "1px solid #e5e7eb",
+        color: "#1f2933",
+        boxShadow: "0 10px 18px rgba(15, 23, 42, 0.12)",
+    };
+
+    const shareCardStyle: React.CSSProperties = {
+        width: "100%",
+        background: "#ffffff",
+        borderRadius: 16,
+        padding: "14px 16px",
+        border: "1px solid #e5e7eb",
+        boxShadow: "0 20px 36px rgba(15, 23, 42, 0.2)",
+        fontFamily: "ui-sans-serif, system-ui, -apple-system",
+    };
+
+    const shareLinkStyle: React.CSSProperties = {
+        marginTop: 6,
+        padding: "8px 10px",
+        borderRadius: 10,
+        background: "#f3f4f6",
+        fontSize: 12,
+        color: "#374151",
+        wordBreak: "break-all",
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+    };
+
+    const copyButtonStyle: React.CSSProperties = {
+        ...buttonBaseStyle,
+        padding: "8px 16px",
+        fontSize: 13,
+        background: "#111827",
+        boxShadow: "none",
+        minWidth: 110,
+    };
+
+    const hideButtonStyle: React.CSSProperties = {
+        border: "none",
+        background: "transparent",
+        color: "#6b7280",
+        cursor: "pointer",
+        fontWeight: 700,
+        padding: "6px 8px",
+        borderRadius: 8,
+        fontSize: 12,
     };
 
     const modalOverlayStyle: React.CSSProperties = {
@@ -919,6 +1231,32 @@ type StoredAuth = {
         fontFamily: "ui-sans-serif, system-ui, -apple-system",
     };
 
+    const hiddenNoticeStyle: React.CSSProperties = {
+        position: "fixed",
+        right: 16,
+        bottom: 16,
+        zIndex: 2147483647,
+        maxWidth: 320,
+        background: "#111827",
+        color: "#e5e7eb",
+        borderRadius: 12,
+        padding: "12px 14px",
+        boxShadow: "0 16px 30px rgba(0, 0, 0, 0.3)",
+        fontFamily: "ui-sans-serif, system-ui, -apple-system",
+        fontSize: 13,
+        lineHeight: 1.4,
+    };
+    const hiddenNoticeCloseStyle: React.CSSProperties = {
+        border: "none",
+        background: "transparent",
+        color: "#e5e7eb",
+        cursor: "pointer",
+        fontWeight: 700,
+        padding: 0,
+        lineHeight: 1,
+        fontSize: 14,
+    };
+
     const labelStyle: React.CSSProperties = {
         display: "block",
         fontSize: 13,
@@ -938,39 +1276,204 @@ type StoredAuth = {
         fontFamily: "inherit",
     };
 
+    const hideControls = () => {
+        setControlsHidden(true);
+        setShowHiddenNotice(true);
+    };
+
+    async function copyShareLink() {
+        if (!shareUrl) return;
+        const text = shareUrl;
+        try {
+            if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text);
+            } else if (typeof document !== "undefined") {
+                const helper = document.createElement("textarea");
+                helper.value = text;
+                helper.style.position = "fixed";
+                helper.style.opacity = "0";
+                helper.style.pointerEvents = "none";
+                document.body.appendChild(helper);
+                helper.focus();
+                helper.select();
+                document.execCommand("copy");
+                document.body.removeChild(helper);
+            } else {
+                throw new Error("clipboard unavailable");
+            }
+            setCopyStatusWithTimeout("copied");
+        } catch {
+            setCopyStatusWithTimeout("error");
+        }
+    }
+
     return (
         <>
             {children}
-            {ready && auth && (
-                <>
-                    <button
+            {!controlsHidden && (shareUrl || ready) && (
+                <div data-repro-internal="1" style={floatingContainerStyle}>
+                    <div
                         data-repro-internal="1"
-                        onClick={() => (recording ? stop() : start())}
-                        style={recordButtonStyle}
+                        style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", width: "100%", gap: 8 }}
+                        aria-label="Recording controls header"
                     >
-                        {btnLabel}
-                    </button>
-                    <button
-                        data-repro-internal="1"
-                        onClick={logout}
-                        style={logoutButtonStyle}
-                        type="button"
-                    >
-                        Log out
-                    </button>
-                </>
+                        <button
+                            type="button"
+                            data-repro-internal="1"
+                            onClick={hideControls}
+                            style={hideButtonStyle}
+                            aria-label="Hide recording controls"
+                        >
+                            Hide
+                        </button>
+                    </div>
+                    {shareUrl && (
+                        <div data-repro-internal="1" style={shareCardStyle}>
+                            <div
+                                style={{
+                                    display: "flex",
+                                    alignItems: "center",
+                                    justifyContent: "space-between",
+                                    gap: 12,
+                                    width: "100%",
+                                }}
+                            >
+                                <div style={{ fontSize: 12, fontWeight: 600, color: "#0f172a" }}>
+                                    Latest capture ready to share
+                                </div>
+                                <button
+                                    type="button"
+                                    data-repro-internal="1"
+                                    onClick={() => clearShareInfo()}
+                                    style={{
+                                        border: "none",
+                                        background: "transparent",
+                                        color: "#9ca3af",
+                                        cursor: "pointer",
+                                        padding: 4,
+                                        lineHeight: 1,
+                                        fontWeight: 700,
+                                        borderRadius: 999,
+                                        width: 24,
+                                        height: 24,
+                                        display: "flex",
+                                        alignItems: "center",
+                                        justifyContent: "center",
+                                    }}
+                                    aria-label="Close share link"
+                                >
+                                    ×
+                                </button>
+                            </div>
+                            <div style={shareLinkStyle} title={shareUrl}>
+                                {shareUrl}
+                            </div>
+                            <div
+                                style={{
+                                    marginTop: 10,
+                                    display: "flex",
+                                    alignItems: "center",
+                                    justifyContent: "space-between",
+                                    gap: 12,
+                                    width: "100%",
+                                }}
+                            >
+                                <span
+                                    style={{
+                                        fontSize: 12,
+                                        minWidth: 100,
+                                        color:
+                                            copyStatus === "copied"
+                                                ? "#059669"
+                                                : copyStatus === "error"
+                                                ? "#b91c1c"
+                                                : "#6b7280",
+                                        visibility: copyStatus === "idle" ? "hidden" : "visible",
+                                        transition: "color 0.2s ease",
+                                    }}
+                                >
+                                    {copyStatus === "copied"
+                                        ? "Link copied!"
+                                        : copyStatus === "error"
+                                        ? "Unable to copy"
+                                        : "placeholder"}
+                                </span>
+                                <button
+                                    type="button"
+                                    data-repro-internal="1"
+                                    onClick={() => void copyShareLink()}
+                                    style={copyButtonStyle}
+                                >
+                                    {copyStatus === "copied" ? "Copied" : "Copy link"}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                    {ready && auth && (
+                        <div data-repro-internal="1" style={buttonRowStyle}>
+                            <button
+                                data-repro-internal="1"
+                                onClick={() => (recording ? stop() : start())}
+                                style={recordButtonStyle}
+                                type="button"
+                            >
+                                <span
+                                    aria-hidden="true"
+                                    style={{
+                                        width: 10,
+                                        height: 10,
+                                        borderRadius: "999px",
+                                        background: recording ? "#fecaca" : "#bbf7d0",
+                                        boxShadow: recording
+                                            ? "0 0 12px rgba(239, 68, 68, 0.7)"
+                                            : "0 0 10px rgba(16, 185, 129, 0.6)",
+                                    }}
+                                />
+                                {btnLabel}
+                            </button>
+                            <button
+                                data-repro-internal="1"
+                                onClick={() => void logout()}
+                                style={logoutButtonStyle}
+                                type="button"
+                            >
+                                Log out
+                            </button>
+                        </div>
+                    )}
+                    {ready && !auth && (
+                        <div data-repro-internal="1" style={buttonRowStyle}>
+                            <button
+                                data-repro-internal="1"
+                                onClick={() => {
+                                    setLoginError(null);
+                                    setShowLogin(true);
+                                }}
+                                style={loginButtonStyle}
+                                type="button"
+                            >
+                                {loginLabel}
+                            </button>
+                        </div>
+                    )}
+                </div>
             )}
-            {ready && !auth && (
-                <button
-                    data-repro-internal="1"
-                    onClick={() => {
-                        setLoginError(null);
-                        setShowLogin(true);
-                    }}
-                    style={loginButtonStyle}
-                >
-                    {loginLabel}
-                </button>
+            {controlsHidden && showHiddenNotice && (
+                <div data-repro-internal="1" style={hiddenNoticeStyle}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                        <div style={{ fontWeight: 700 }}>Recording controls hidden</div>
+                        <button
+                            type="button"
+                            data-repro-internal="1"
+                            style={hiddenNoticeCloseStyle}
+                            aria-label="Close hidden controls message"
+                            onClick={() => setShowHiddenNotice(false)}
+                        >
+                            ×
+                        </button>
+                    </div>
+                    <div>Press Ctrl/Cmd + R + O to show them again.</div>
+                </div>
             )}
             {showLogin && (
                 <div
