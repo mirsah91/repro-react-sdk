@@ -236,6 +236,7 @@ type StoredAuth = {
 
     const [ready, setReady] = useState(false);
     const [recording, setRecording] = useState(false);
+    const recordingRef = useRef(false);
     const [auth, setAuth] = useState<StoredAuth>(initialAuth);
     const userPasswordRef = useRef<string | null>(initialAuth?.password ?? null);
     const userTokenRef = useRef<string | null>(initialAuth?.token ?? null);
@@ -806,7 +807,7 @@ type StoredAuth = {
 
     // ---- START recording ----
     async function start() {
-        if (!sdkTokenRef.current || recording) return;
+        if (!sdkTokenRef.current || recordingRef.current) return;
 
         // 1) start session
         if (!requireAuth()) return;
@@ -982,13 +983,14 @@ type StoredAuth = {
             void stop();
         }, SESSION_MAX_MS);
 
+        recordingRef.current = true;
         setRecording(true);
     }
 
     // ---- STOP recording ----
     async function stop() {
         clearSessionExpiryTimer();
-        if (!recording || isStoppingRef.current) return;
+        if (!recordingRef.current || isStoppingRef.current) return;
         isStoppingRef.current = true;
 
         try {
@@ -1092,6 +1094,7 @@ type StoredAuth = {
             lastClickRef.current = null;
 
             setRecording(false);
+            recordingRef.current = false;
             isStoppingRef.current = false;
         }
     }
