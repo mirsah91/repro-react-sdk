@@ -19,8 +19,6 @@ export type MaskingOptions = Pick<
 
 type Props = {
     appId: string;
-    tenantId: string;
-    apiBase?: string; // default: http://localhost:4000
     children: React.ReactNode;
     button?: { text?: string }; // optional override label
     masking?: MaskingOptions;
@@ -70,9 +68,9 @@ async function getJSON<T>(url: string, headers?: HeadersInit) {
 
 const INTERNAL_HEADER = "X-Repro-Internal";
 const REQUEST_START_HEADER = "X-Bug-Request-Start";
-const TENANT_HEADER = "x-tenant-id";
 const NGROK_SKIP_HEADER = "ngrok-skip-browser-warning";
 const NGROK_SKIP_VALUE = "true";
+const API_BASE = "https://oozy-loreta-gully.ngrok-free.dev";
 
 // --- manual Axios attach support (module-scoped ctx) ---
 type ReproCtx = {
@@ -82,7 +80,6 @@ type ReproCtx = {
     getToken: () => string | null;
     getUserToken: () => string | null;
     getUserPassword: () => string | null;
-    getTenantId: () => string | null;
     getFetch: () => typeof window.fetch;
     hasReqMarked: Set<string>;
     onUnauthorized?: () => void;
@@ -100,7 +97,6 @@ export function attachAxios(axiosInstance: any) {
 
         const sid = ctx.getSid();
         const aid = ctx.getAid();
-        const tenantId = ctx.getTenantId();
         const url = `${config.baseURL || ""}${config.url || ""}`;
         const isInternal = url.startsWith(ctx.base);
         const isSdkInternal = !!config.headers?.[INTERNAL_HEADER];
@@ -122,9 +118,6 @@ export function attachAxios(axiosInstance: any) {
         const userToken = ctx.getUserToken();
         if (isInternal) {
             setHeader(NGROK_SKIP_HEADER, NGROK_SKIP_VALUE);
-            if (tenantId) {
-                setHeader(TENANT_HEADER, tenantId);
-            }
             if (sdkToken && !(config.headers as any)["x-sdk-token"]) {
                 setHeader("x-sdk-token", sdkToken);
             }
@@ -177,15 +170,15 @@ export function attachAxios(axiosInstance: any) {
 
 type ActionMeta = { tStart: number; label?: string };
 
-export function ReproProvider({ appId, tenantId, apiBase, children, button, masking }: Props) {
-    const base = apiBase || "http://localhost:4000";
+export function ReproProvider({ appId, children, button, masking }: Props) {
+    const base = API_BASE;
 type StoredAuth = {
     email: string;
     password?: string | null;
     token: string;
     data: any;
 } | null;
-    const storageKey = `repro-auth-${tenantId}-${appId}`;
+    const storageKey = `repro-auth-${appId}`;
 
     const initialAuth: StoredAuth = (() => {
         if (typeof window === "undefined") return null;
@@ -240,7 +233,6 @@ type StoredAuth = {
     const [auth, setAuth] = useState<StoredAuth>(initialAuth);
     const userPasswordRef = useRef<string | null>(initialAuth?.password ?? null);
     const userTokenRef = useRef<string | null>(initialAuth?.token ?? null);
-    const tenantIdRef = useRef<string>(tenantId);
     const [showLogin, setShowLogin] = useState(false);
     const [loginEmail, setLoginEmail] = useState(initialAuth?.email ?? "");
     const [loginPassword, setLoginPassword] = useState(initialAuth?.password ?? "");
@@ -295,40 +287,25 @@ type StoredAuth = {
         sessionExpiryTimerRef.current = null;
     };
 
-    const addTenantHeader = (headers: Record<string, string>) => {
-        const tenant = tenantIdRef.current;
-        const next: Record<string, string> = {
-            ...headers,
-            [NGROK_SKIP_HEADER]: NGROK_SKIP_VALUE,
-        };
-        if (tenant) {
-            next[TENANT_HEADER] = tenant;
-        }
-        return next;
-    };
+    const addTenantHeader = (headers: Record<string, string>) => ({
+        ...headers,
+        [NGROK_SKIP_HEADER]: NGROK_SKIP_VALUE,
+    });
 
     const setTenantOnHeaders = (headers: Headers, isInternal?: boolean) => {
         if (isInternal) {
             headers.set(NGROK_SKIP_HEADER, NGROK_SKIP_VALUE);
         }
-        const tenant = tenantIdRef.current;
-        if (tenant) headers.set(TENANT_HEADER, tenant);
     };
-
-    // keep manual-attach ctx in sync so attachAxios() sees live refs
-    useEffect(() => {
-        tenantIdRef.current = tenantId;
-    }, [tenantId]);
 
     useEffect(() => {
         __reproCtx = {
             base,
             getSid: () => sessionIdRef.current,
             getAid: () => currentAidRef.current,
-        getToken: () => sdkTokenRef.current,
-        getUserToken: () => userTokenRef.current,
-        getUserPassword: () => userPasswordRef.current,
-            getTenantId: () => tenantIdRef.current,
+            getToken: () => sdkTokenRef.current,
+            getUserToken: () => userTokenRef.current,
+            getUserPassword: () => userPasswordRef.current,
             getFetch: () => (origFetchRef.current ?? window.fetch.bind(window)),
             hasReqMarked: hasReqMarkedRef.current,
             onUnauthorized: () => handleUnauthorized(),
@@ -336,7 +313,7 @@ type StoredAuth = {
         return () => {
             __reproCtx = null;
         };
-    }, [base, tenantId]);
+    }, [base]);
 
     useEffect(() => {
         const storedToken = initialAuthRef.current?.token ?? null;
@@ -615,7 +592,7 @@ type StoredAuth = {
         if (isFlushingRef.current) return;
         const sid = sessionIdRef.current;
         const token = sdkTokenRef.current;
-        const baseUrl = apiBase || "http://localhost:4000";
+        const baseUrl = API_BASE;
         if (!sid || !token) return;
         if (!rrBufferRef.current.length) return;
 
@@ -726,9 +703,6 @@ type StoredAuth = {
             if (isInternal) {
                 config.headers = config.headers || {};
                 config.headers[NGROK_SKIP_HEADER] = NGROK_SKIP_VALUE;
-                if (tenantIdRef.current) {
-                    config.headers[TENANT_HEADER] = tenantIdRef.current;
-                }
             }
 
             if (sid && aid && !isInternal && !isSdkInternal) {
