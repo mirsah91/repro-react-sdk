@@ -19,7 +19,6 @@ export type MaskingOptions = Pick<
 
 type Props = {
     appId: string;
-    apiBase?: string; // default: http://localhost:4000
     children: React.ReactNode;
     button?: { text?: string }; // optional override label
     masking?: MaskingOptions;
@@ -71,6 +70,7 @@ const INTERNAL_HEADER = "X-Repro-Internal";
 const REQUEST_START_HEADER = "X-Bug-Request-Start";
 const NGROK_SKIP_HEADER = "ngrok-skip-browser-warning";
 const NGROK_SKIP_VALUE = "true";
+const API_BASE = "https://oozy-loreta-gully.ngrok-free.dev";
 
 // --- manual Axios attach support (module-scoped ctx) ---
 type ReproCtx = {
@@ -170,8 +170,8 @@ export function attachAxios(axiosInstance: any) {
 
 type ActionMeta = { tStart: number; label?: string };
 
-export function ReproProvider({ appId, apiBase, children, button, masking }: Props) {
-    const base = apiBase || "http://localhost:4000";
+export function ReproProvider({ appId, children, button, masking }: Props) {
+    const base = API_BASE;
 type StoredAuth = {
     email: string;
     password?: string | null;
@@ -592,7 +592,7 @@ type StoredAuth = {
         if (isFlushingRef.current) return;
         const sid = sessionIdRef.current;
         const token = sdkTokenRef.current;
-        const baseUrl = apiBase || "http://localhost:4000";
+        const baseUrl = API_BASE;
         if (!sid || !token) return;
         if (!rrBufferRef.current.length) return;
 
